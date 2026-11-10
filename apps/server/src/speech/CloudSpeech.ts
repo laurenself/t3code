@@ -18,11 +18,13 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
 import { FetchHttpClient, HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http";
 import * as ServerSettings from "../serverSettings.ts";
 import { requireSettingsSecret } from "../secrets/settingsSecretValue.ts";
+import { CodexSpeech } from "./CodexSpeech.ts";
 import { applySpeechAliases } from "./customWords.ts";
 import { removeSpeechFillerWords } from "./fillerWords.ts";
 import { decodeSpeechPcm, SpeechInvalidAudioError } from "./SpeechService.ts";
@@ -126,16 +128,30 @@ export const layer = Layer.effect(
     const settings = yield* ServerSettings.ServerSettingsService;
     const resolver = yield* SecretResolver.SecretResolver;
     const http = yield* HttpClient.HttpClient;
+    // Without a saved OpenAI key, OpenAI dictation rides the ChatGPT login Codex holds here.
+    const codex = yield* Effect.serviceOption(CodexSpeech);
+    const codexAvailable = Option.match(codex, {
+      onNone: () => Effect.succeed(false),
+      onSome: (service) => service.available,
+    });
     const credentials = settings.getSettings.pipe(
       Effect.map((value) => value.cloudSpeechCredentials),
     );
-    const configured = credentials.pipe(
-      Effect.map(({ openai, xai, openrouter }) => ({
-        openai: Boolean(openai),
+    const configured = Effect.all([credentials, codexAvailable]).pipe(
+      Effect.map(([{ openai, xai, openrouter }, codexSignedIn]) => ({
+        openai: Boolean(openai) || codexSignedIn,
         xai: Boolean(xai),
         openrouter: Boolean(openrouter),
       })),
     );
+    const finishText = (text: string, language: string, options: SpeechTranscriptionOptions) => {
+      const corrected = applySpeechAliases(text, options.speechCustomWords);
+      return (
+        options.speechRemoveFillerWords
+          ? removeSpeechFillerWords(corrected, language, options.speechCorrectionWord)
+          : corrected
+      ).trim();
+    };
     const execute = (request: HttpClientRequest.HttpClientRequest) =>
       http
         .execute(request)
@@ -186,6 +202,22 @@ export const layer = Layer.effect(
         model?: string,
       ) {
         const source = (yield* credentials)[provider];
+        if (!source && provider === "openai" && Option.isSome(codex)) {
+          const samples = yield* Effect.try({
+            try: () => decodeSpeechPcm(pcm),
+            catch: () =>
+              new SpeechInvalidAudioError({
+                byteLength: pcm.byteLength,
+                message: "Invalid PCM audio.",
+              }),
+          });
+          const text = yield* codex.value.transcribe(wave(samples));
+          return finishText(
+            text,
+            effectiveSpeechLanguage(cloudSpeechLanguages, options.speechLanguage),
+            options,
+          );
+        }
         if (!source) return yield* new CloudSpeechError({ provider, reason: "missing-key" });
         if (provider === "openrouter" && (!model || !isModelId(model)))
           return yield* new CloudSpeechError({ provider, reason: "model-unavailable" });
@@ -238,12 +270,7 @@ export const layer = Layer.effect(
         const { text } = yield* HttpClientResponse.schemaBodyJson(
           EnvironmentSpeechTranscriptionResult,
         )(response).pipe(Effect.mapError(unavailable));
-        const corrected = applySpeechAliases(text, options.speechCustomWords);
-        return (
-          options.speechRemoveFillerWords
-            ? removeSpeechFillerWords(corrected, language, options.speechCorrectionWord)
-            : corrected
-        ).trim();
+        return finishText(text, language, options);
       },
       (effect, provider) =>
         effect.pipe(

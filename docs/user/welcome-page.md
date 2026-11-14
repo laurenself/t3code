@@ -103,7 +103,9 @@ malformed records and skips unreadable or unparseable conversations.
 
 Each import attempt reads up to 100 conversation files and 4 GiB per project. To
 continue a large batch, open the Welcome page again and pick the project in
-**Review all**. Completed conversations are not imported again. You can continue
+**Review all**. An imported conversation is not imported a second time; turns it
+gains later are added to its thread
+([Continuing terminal sessions](./terminal-sessions.md)). You can continue
 without the remaining history.
 
 You can start without importing. While an import runs, T3 Code stays on the

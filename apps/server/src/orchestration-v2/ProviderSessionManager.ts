@@ -1,4 +1,5 @@
 import { AgentScope } from "@t3tools/shared/AgentScope";
+import { isNativeSessionThreadId } from "../project/nativeSessionThread.ts";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import {
@@ -58,6 +59,12 @@ import * as ProjectionStore from "./ProjectionStore.ts";
 
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_MAX_IDLE_PIN_MS = 4 * 60 * 60 * 1000;
+/**
+ * A thread that mirrors a session from outside T3 is unloaded as soon as its turn
+ * settles. A loaded Codex thread holds the session's writer lock, and the terminal
+ * the session came from cannot resume it until that lock is gone.
+ */
+const NATIVE_SESSION_THREAD_UNLOAD_MS = 2_000;
 const RELEASE_SCOPE_CLOSE_TIMEOUT_MS = 30 * 1000;
 /** Past adapters' own 10 s stop fallbacks, so they settle first when the provider answers at all. */
 export const PROVIDER_INTERRUPT_TIMEOUT_MS = 15 * 1000;
@@ -1632,7 +1639,10 @@ export const layerWithOptions = (
           if (tracked === undefined) return;
           const [threadId, pending] = tracked;
           const generation = pending.generation + 1;
-          const fiber = yield* Effect.sleep(Duration.millis(idleTimeoutMs)).pipe(
+          const unloadAfterMs = isNativeSessionThreadId(threadId)
+            ? Math.min(idleTimeoutMs, NATIVE_SESSION_THREAD_UNLOAD_MS)
+            : idleTimeoutMs;
+          const fiber = yield* Effect.sleep(Duration.millis(unloadAfterMs)).pipe(
             Effect.andThen(unloadIdleThread({ providerSessionId, threadId, generation })),
             Effect.forkIn(layerScope),
           );
@@ -1646,6 +1656,28 @@ export const layerWithOptions = (
           );
         },
       );
+
+      const otherWorkingThreads: ProviderSessionManagerV2["Service"]["otherWorkingThreads"] =
+        Effect.fn("ProviderSessionManager.otherWorkingThreads")(function* (input) {
+          const entry = (yield* Ref.get(sessions)).get(sessionKey(input.providerSessionId));
+          if (entry === undefined || !entry.supportsMultipleProviderThreads) return [];
+          return yield* Effect.filter(
+            [...entry.attachedThreadIds].filter((threadId) => threadId !== input.threadId),
+            (threadId) =>
+              // Runs, not the shell's activeRunId: the shell omits silent runs such as idle
+              // compaction. Background work outlives its run and still needs the process.
+              Effect.zipWith(
+                projectionStore.getThreadRecords(threadId, ["runs"]),
+                projectionStore.getThreadShell(threadId),
+                ({ runs }, shell) =>
+                  runs.some((run) => WORKING_RUN_STATUSES.has(run.status)) ||
+                  (shell?.pendingBackgroundTasks?.length ?? 0) > 0,
+              ).pipe(
+                // An unreadable thread may still be working; never kill it unseen.
+                Effect.orElseSucceed(() => true),
+              ),
+          );
+        });
 
       const unloadIdleThread = Effect.fn("ProviderSessionManager.unloadIdleThread")(
         function* (input: {
@@ -1728,6 +1760,20 @@ export const layerWithOptions = (
           if (outcome === "deferred") {
             yield* Effect.sleep(Duration.millis(idleTimeoutMs));
             return yield* unloadIdleThread(input);
+          }
+          // Codex keeps an unsubscribed thread's writer lock for as long as its process
+          // lives, so the terminal a mirrored session came from could not resume it.
+          // With nothing else running on the process, ending it frees the session.
+          if (outcome === "unloaded" && isNativeSessionThreadId(input.threadId)) {
+            const working = yield* otherWorkingThreads(input);
+            if (working.length === 0) {
+              yield* releaseEntry({
+                providerSessionId: input.providerSessionId,
+                reason: "idle_timeout",
+                detail: "Released so the session can continue outside T3 Code.",
+                keepIfBusyOtherThan: [],
+              }).pipe(Effect.ignore);
+            }
           }
         },
       );
@@ -2651,28 +2697,7 @@ export const layerWithOptions = (
           // Identity, not presence: open can install a replacement under the same id meanwhile.
           return before !== undefined && (yield* Ref.get(sessions)).get(key) !== before;
         }),
-        otherWorkingThreads: Effect.fn("ProviderSessionManager.otherWorkingThreads")(
-          function* (input) {
-            const entry = (yield* Ref.get(sessions)).get(sessionKey(input.providerSessionId));
-            if (entry === undefined || !entry.supportsMultipleProviderThreads) return [];
-            return yield* Effect.filter(
-              [...entry.attachedThreadIds].filter((threadId) => threadId !== input.threadId),
-              (threadId) =>
-                // Runs, not the shell's activeRunId: the shell omits silent runs such as idle
-                // compaction. Background work outlives its run and still needs the process.
-                Effect.zipWith(
-                  projectionStore.getThreadRecords(threadId, ["runs"]),
-                  projectionStore.getThreadShell(threadId),
-                  ({ runs }, shell) =>
-                    runs.some((run) => WORKING_RUN_STATUSES.has(run.status)) ||
-                    (shell?.pendingBackgroundTasks?.length ?? 0) > 0,
-                ).pipe(
-                  // An unreadable thread may still be working; never kill it unseen.
-                  Effect.orElseSucceed(() => true),
-                ),
-            );
-          },
-        ),
+        otherWorkingThreads,
         detach: Effect.fn("ProviderSessionManager.detach")(
           function* (input) {
             const key = sessionKey(input.providerSessionId);

@@ -1,3 +1,4 @@
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
 import {
   type AgentSessionSource,
@@ -48,6 +49,7 @@ const persistence = Layer.mergeAll(
   EventSink.layer.pipe(Layer.provide(stores)),
   ProviderSessionRuntime.layer.pipe(Layer.provide(SqlitePersistence.layerMemory)),
   IdAllocator.layer,
+  NodeServices.layer,
 );
 
 function candidate(
@@ -237,7 +239,7 @@ const makeImporter = Effect.fn(function* (
                   (entry) => options?.skipTranscript?.(entry.source) !== true,
                 ),
               ),
-            refreshCandidates: Effect.void,
+            refreshCandidates: Effect.succeed([]),
           }),
           Layer.mock(ProjectService.ProjectService)({
             getById: () => Effect.succeedSome(project),

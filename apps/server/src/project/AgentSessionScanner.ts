@@ -227,8 +227,11 @@ export class AgentSessionScanner extends Context.Service<
       completedSources?: ReadonlyArray<AgentSessionImportSource>,
       options?: AgentSessionRecentThreadsOptions,
     ) => Stream.Stream<AgentSessionRecentThread, AgentSessionScanError>;
-    /** Re-lists transcripts on disk so sessions started after the last scan are seen. */
-    readonly refreshCandidates: Effect.Effect<void, AgentSessionScanError>;
+    /**
+     * Re-lists transcripts on disk so sessions started after the last scan are seen.
+     * Returns the directories transcripts are written under, for watching.
+     */
+    readonly refreshCandidates: Effect.Effect<ReadonlyArray<string>, AgentSessionScanError>;
   }
 >()("t3/project/AgentSessionScanner") {}
 
@@ -1426,6 +1429,7 @@ export const make = Effect.gen(function* () {
     );
 
     const raw: Array<RawCandidate> = [];
+    const transcriptRoots: Array<string> = [];
     let truncated = false;
 
     for (const source of ["claudeAgent", "codex", "pi"] as const) {
@@ -1518,6 +1522,13 @@ export const make = Effect.gen(function* () {
             : source === "codex"
               ? discoverCodexTranscripts
               : discoverPiTranscripts;
+        transcriptRoots.push(
+          source === "claudeAgent"
+            ? path.join(home.homePath, "projects")
+            : source === "codex"
+              ? path.join(home.homePath, "sessions")
+              : home.homePath,
+        );
         const discovered = yield* discover(home.homePath, home.providerInstanceId, operationBudget);
         truncated ||= discovered.truncated;
         transcriptCandidates.push(...discovered.transcripts);
@@ -1541,7 +1552,7 @@ export const make = Effect.gen(function* () {
       truncated ||= metadataBudget.truncated;
     }
 
-    return { candidates: raw, truncated };
+    return { candidates: raw, truncated, transcriptRoots };
   });
 
   let cachedCandidates: ReadonlyArray<RawCandidate> | null = null;
@@ -1908,7 +1919,9 @@ export const make = Effect.gen(function* () {
 
   const refreshCandidates: AgentSessionScanner["Service"]["refreshCandidates"] = Effect.gen(
     function* () {
-      cachedCandidates = (yield* collectCandidates()).candidates;
+      const collected = yield* collectCandidates();
+      cachedCandidates = collected.candidates;
+      return collected.transcriptRoots;
     },
   );
 

@@ -25,13 +25,16 @@ import {
 } from "@t3tools/contracts";
 import { normalizeProjectPathForComparison } from "@t3tools/shared/path";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
+import * as Clock from "effect/Clock";
 import * as Config from "effect/Config";
 import * as Context from "effect/Context";
 import * as Duration from "effect/Duration";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
@@ -57,6 +60,10 @@ const DEFAULT_SYNC_INTERVAL = Duration.minutes(2);
 const SYNC_STARTUP_DELAY = Duration.seconds(20);
 const SYNC_PROJECT_PAGE_SIZE = 100;
 const MAX_IGNORED_TRANSCRIPTS = 10_000;
+/** A turn writes its records in a burst; one sync after it settles reads them all. */
+const TRANSCRIPT_CHANGE_DEBOUNCE = Duration.seconds(1);
+/** A changed file no project claims is looked for again only after this long. */
+const UNPLACED_TRANSCRIPT_RETRY_MS = 15_000;
 /** A run that can still write to its native session. */
 const OPEN_RUN_STATUSES: ReadonlySet<string> = new Set([
   "preparing",
@@ -208,6 +215,8 @@ const make = Effect.gen(function* () {
   const projects = yield* ProjectService.ProjectService;
   const eventSink = yield* EventSink.EventSinkV2;
   const idAllocator = yield* IdAllocator.IdAllocatorV2;
+  const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
   const turnItemPositions = yield* TurnItemPositionStore.TurnItemPositionStoreV2;
   const runtimes = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
   const settingsService = yield* ServerSettings.ServerSettingsService;
@@ -221,6 +230,8 @@ const make = Effect.gen(function* () {
   };
   const skipTranscript = (transcript: { readonly filePath: string }) =>
     nativeTranscripts.has(transcript.filePath);
+  // Which project each transcript belongs to, so a change to one file syncs one project.
+  const transcriptProjects = new Map<string, ProjectId>();
   /**
    * Appends the turns a native session gained outside T3 (in a terminal) to the
    * thread that mirrors it. Turns T3 ran itself are already in the thread as
@@ -350,6 +361,8 @@ const make = Effect.gen(function* () {
           return;
         }
         const source = outcome.source;
+        if (transcriptProjects.size >= MAX_IGNORED_TRANSCRIPTS) transcriptProjects.clear();
+        transcriptProjects.set(source.filePath, input.projectId);
         const threadId = nativeSessionThreadId(source);
         if (outcome._tag === "AlreadyImported") {
           importedThreadIds.add(threadId);
@@ -568,8 +581,41 @@ const make = Effect.gen(function* () {
   const importLocked = (input: AgentSessionImportInput) =>
     importLock.withPermits(1)(importRecentAgentThreads(input));
 
-  const syncAllProjects = Effect.gen(function* () {
-    yield* scanner.refreshCandidates;
+  // Off with the background sync, so tests and one-shot commands leave no watchers behind.
+  let watchWanted = false;
+  const watchedRoots = new Set<string>();
+  const changedTranscripts = new Set<string>();
+  const unplacedTranscripts = new Map<string, number>();
+  let lastFullSyncAt = 0;
+  const serviceScope = yield* Effect.scope;
+
+  const syncAllProjects: Effect.Effect<
+    number,
+    AgentSessionScanError | ProjectService.ProjectOperationError
+  > = Effect.gen(function* () {
+    const transcriptRoots = yield* scanner.refreshCandidates;
+    lastFullSyncAt = yield* Clock.currentTimeMillis;
+    for (const root of transcriptRoots) {
+      if (!watchWanted || watchedRoots.has(root)) continue;
+      watchedRoots.add(root);
+      yield* fileSystem.watch(root, { recursive: true }).pipe(
+        Stream.filter((event) => event.path.endsWith(".jsonl")),
+        Stream.tap((event) =>
+          Effect.sync(() => {
+            changedTranscripts.add(path.resolve(root, event.path));
+          }),
+        ),
+        Stream.debounce(TRANSCRIPT_CHANGE_DEBOUNCE),
+        Stream.runForEach(() => syncChangedTranscripts),
+        // A root that does not exist yet is watched once a later pass finds it.
+        Effect.catchCause((cause) =>
+          Effect.logDebug("Agent session watch stopped", { root, cause }).pipe(
+            Effect.andThen(Effect.sync(() => watchedRoots.delete(root))),
+          ),
+        ),
+        Effect.forkIn(serviceScope),
+      );
+    }
     let cursor: number | null = 0;
     let imported = 0;
     while (cursor !== null) {
@@ -596,6 +642,37 @@ const make = Effect.gen(function* () {
     return imported;
   });
 
+  /** Syncs the projects whose transcripts changed; a file no project claims yet takes a full pass. */
+  const syncChangedTranscripts: Effect.Effect<void> = Effect.gen(function* () {
+    const changed = Array.from(changedTranscripts);
+    changedTranscripts.clear();
+    const now = yield* Clock.currentTimeMillis;
+    const projectIds = new Set<ProjectId>();
+    const unplaced: Array<string> = [];
+    for (const filePath of changed) {
+      if (nativeTranscripts.has(filePath)) continue;
+      const projectId = transcriptProjects.get(filePath);
+      if (projectId !== undefined) {
+        projectIds.add(projectId);
+      } else if (now - (unplacedTranscripts.get(filePath) ?? 0) >= UNPLACED_TRANSCRIPT_RETRY_MS) {
+        unplaced.push(filePath);
+      }
+    }
+    if (unplaced.length > 0 && now - lastFullSyncAt >= UNPLACED_TRANSCRIPT_RETRY_MS) {
+      yield* syncAllProjects;
+      if (unplacedTranscripts.size >= MAX_IGNORED_TRANSCRIPTS) unplacedTranscripts.clear();
+      for (const filePath of unplaced) {
+        if (!transcriptProjects.has(filePath)) unplacedTranscripts.set(filePath, now);
+      }
+      return;
+    }
+    for (const projectId of projectIds) {
+      yield* importLocked({ projectId });
+    }
+  }).pipe(
+    Effect.catchCause((cause) => Effect.logDebug("Agent session change sync failed", { cause })),
+  );
+
   const syncInterval = yield* Config.option(Config.String(SYNC_INTERVAL_ENV)).pipe(
     Effect.map(
       Option.match({
@@ -611,6 +688,7 @@ const make = Effect.gen(function* () {
     ),
     Effect.orElseSucceed(() => Option.some(DEFAULT_SYNC_INTERVAL)),
   );
+  watchWanted = Option.isSome(syncInterval);
   if (Option.isSome(syncInterval)) {
     yield* syncAllProjects.pipe(
       Effect.catchCause((cause) =>

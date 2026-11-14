@@ -894,6 +894,21 @@ it.effect(
     }).pipe(Effect.scoped, Effect.provide(persistence)),
 );
 
+it.effect("keeps one project prefix on a session title T3 wrote back", () =>
+  Effect.gen(function* () {
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const base = candidate(CODEX_MODEL_SELECTION, "retitled");
+    const retitled = { ...base, thread: { ...base.thread, title: "Project · Imported thread" } };
+    expect(yield* (yield* makeImporter([retitled])).run).toEqual({
+      importedCount: 1,
+      skippedCount: 0,
+    });
+    expect((yield* projections.getThread(importId(retitled))).title).toBe(
+      "Project · Imported thread",
+    );
+  }).pipe(Effect.scoped, Effect.provide(persistence)),
+);
+
 it.effect("appends turns a session gained outside T3, once, and leaves out the ones T3 wrote", () =>
   Effect.gen(function* () {
     const projections = yield* ProjectionStore.ProjectionStoreV2;

@@ -140,8 +140,12 @@ export function isNativeHistoryPending(input: {
 
 const TITLE_SEPARATOR = " · ";
 /** The thread list shows no folder, so a mirrored session's title leads with its project. */
-const nativeSessionTitle = (project: string, session: string) =>
-  `${project}${TITLE_SEPARATOR}${session.trim() === "" ? "Untitled thread" : session}`;
+const nativeSessionTitle = (project: string, session: string) => {
+  if (session.trim() === "") return `${project}${TITLE_SEPARATOR}Untitled thread`;
+  // A T3 turn writes the thread's title back into the session, prefix included.
+  if (session.startsWith(`${project}${TITLE_SEPARATOR}`)) return session;
+  return `${project}${TITLE_SEPARATOR}${session}`;
+};
 
 function dateTime(value: string): DateTime.Utc {
   return DateTime.makeUnsafe(value);

@@ -48,6 +48,7 @@ import * as ProviderSessionManager from "../orchestration-v2/ProviderSessionMana
 import * as TurnItemPositionStore from "../orchestration-v2/TurnItemPositionStore.ts";
 import * as ProviderSessionRuntime from "../persistence/ProviderSessionRuntime.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import { busyClaudeTerminalSessions } from "../provider/Drivers/ClaudeTerminalSessions.ts";
 import * as AgentSessionScanner from "./AgentSessionScanner.ts";
 import { nativeSessionThreadId } from "./nativeSessionThread.ts";
 import * as ProjectService from "./ProjectService.ts";
@@ -74,6 +75,12 @@ const OPEN_RUN_STATUSES: ReadonlySet<string> = new Set([
   "running",
   "waiting",
 ]);
+const BUSY_SESSIONS_CACHE_MS = 500;
+const PROCESS_CHANGE_DEBOUNCE = Duration.millis(300);
+/** An imported session this recent is still in play, so it is not filed under Settled. */
+const RECENT_SESSION_MS = 24 * 60 * 60 * 1000;
+/** A Codex turn with no ending and no writes for this long was cut off. */
+const STALLED_TURN_MS = 15 * 60 * 1000;
 /** Transcript records land slightly outside the run that wrote them. */
 const RUN_WINDOW_SLACK_MS = 2_000;
 const CLAUDE_SESSION_ID_PATTERN =
@@ -118,6 +125,11 @@ class AgentSessionThreadModifiedError extends Schema.TaggedError<AgentSessionThr
     return `Imported thread '${this.threadId}' already contains non-imported activity.`;
   }
 }
+
+const TITLE_SEPARATOR = " · ";
+/** The thread list shows no folder, so a mirrored session's title leads with its project. */
+const nativeSessionTitle = (project: string, session: string) =>
+  `${project}${TITLE_SEPARATOR}${session.trim() === "" ? "Untitled thread" : session}`;
 
 function dateTime(value: string): DateTime.Utc {
   return DateTime.makeUnsafe(value);
@@ -250,13 +262,29 @@ const make = Effect.gen(function* () {
         AND json_extract(payload_json, '$.nativeThreadRef.nativeId') = ${nativeId}
       LIMIT 1
     `.pipe(Effect.map((rows) => rows[0]?.threadId));
+  const claudeConfigDirs = new Set<string>();
+  // Claude's process files are read once per burst of work, not once per thread.
+  const busyClaudeCache = new Map<string, { readonly at: number; readonly busy: Set<string> }>();
+  const busyClaudeSessions = Effect.fn("agentSessionBusyClaudeSessions")(function* (
+    configDir: string,
+  ) {
+    const now = yield* Clock.currentTimeMillis;
+    const cached = busyClaudeCache.get(configDir);
+    if (cached !== undefined && now - cached.at < BUSY_SESSIONS_CACHE_MS) return cached.busy;
+    const busy = yield* busyClaudeTerminalSessions(configDir).pipe(
+      Effect.provideService(FileSystem.FileSystem, fileSystem),
+      Effect.provideService(Path.Path, path),
+    );
+    busyClaudeCache.set(configDir, { at: now, busy });
+    return busy;
+  });
   // Which project each transcript belongs to, so a change to one file syncs one project.
   const transcriptProjects = new Map<string, ProjectId>();
   /**
    * Appends the turns a native session gained outside T3 (in a terminal) to the
    * thread that mirrors it. Turns T3 ran itself are already in the thread as
-   * runs, so records written inside a run are left out. Returns false while a
-   * run is open: its records are still arriving, and the next pass reads them.
+   * runs, so records written inside a run are left out. Returns how many it added,
+   * or null while a run is open: its records are still arriving, and the next pass reads them.
    */
   const appendOutsideTurns = Effect.fn("appendOutsideAgentTurnsV2")(function* (input: {
     readonly threadId: ThreadId;
@@ -272,7 +300,7 @@ const make = Effect.gen(function* () {
       "runs",
       "providerSessions",
     ]);
-    if (records.runs.some((run) => OPEN_RUN_STATUSES.has(run.status))) return false;
+    if (records.runs.some((run) => OPEN_RUN_STATUSES.has(run.status))) return null;
     const millis = (value: DateTime.Utc) => DateTime.toEpochMillis(value);
     const runWindows = records.runs.map((run) => ({
       from: millis(run.requestedAt) - RUN_WINDOW_SLACK_MS,
@@ -306,7 +334,7 @@ const make = Effect.gen(function* () {
       seen.add(key);
       return true;
     });
-    if (outside.length === 0) return true;
+    if (outside.length === 0) return 0;
 
     const events = outside.flatMap((message) =>
       messageEvents({ threadId: input.threadId, key: syncedMessageKey(message), message }),
@@ -337,8 +365,140 @@ const make = Effect.gen(function* () {
         })
         .pipe(Effect.ignore);
     }
-    return true;
+    return outside.length;
   });
+
+  /** Whether a terminal is running a turn on the session this transcript belongs to. */
+  const outsideTurnOpen = Effect.fn("agentSessionOutsideTurnOpen")(function* (input: {
+    readonly thread: AgentSessionScanner.AgentSessionThread;
+    readonly source: AgentSessionImportSource;
+  }) {
+    if (input.thread.source === "claudeAgent") {
+      // <config dir>/projects/<project>/<session>.jsonl
+      const configDir = path.resolve(path.dirname(input.source.filePath), "..", "..");
+      claudeConfigDirs.add(configDir);
+      return (yield* busyClaudeSessions(configDir)).has(input.thread.providerSessionId);
+    }
+    if (input.thread.turnOpen !== true || input.source.mtimeMs === null) return false;
+    return (yield* Clock.currentTimeMillis) - input.source.mtimeMs < STALLED_TURN_MS;
+  });
+
+  /**
+   * Keeps a mirrored thread's place in the thread list true to its session:
+   * working while a terminal runs a turn on it, back in the list when the
+   * terminal adds to it, and titled after its project and the session's own title.
+   */
+  const presentNativeSession = Effect.fn("presentNativeSessionV2")(function* (input: {
+    readonly threadId: ThreadId;
+    readonly working: boolean;
+    readonly continuedOutside: boolean;
+    readonly title?: { readonly project: string; readonly session: string };
+    readonly lastActiveAt?: DateTime.Utc;
+  }) {
+    const { thread, runs } = yield* orchestrator.getThreadRecords(input.threadId, ["runs"]);
+    const now = yield* DateTime.now;
+    const startedAt = thread.outsideTurnStartedAt ?? null;
+    const settled = thread.settledOverride === "settled" || thread.settledAt !== null;
+    // Filed under Settled by the import itself, not by the user, and recent.
+    const filedByImport =
+      thread.settledOverride === "settled" &&
+      thread.settledAt !== null &&
+      DateTime.toEpochMillis(thread.settledAt) === DateTime.toEpochMillis(thread.updatedAt) &&
+      input.lastActiveAt !== undefined &&
+      DateTime.toEpochMillis(now) - DateTime.toEpochMillis(input.lastActiveAt) < RECENT_SESSION_MS;
+    const unsettle =
+      settled && (input.continuedOutside || (input.working && startedAt === null) || filedByImport);
+    const title =
+      input.title !== undefined &&
+      // A title the user gave the thread in T3 Code stays.
+      (runs.length === 0 ||
+        thread.title === input.title.session ||
+        thread.title.startsWith("<") ||
+        thread.title.startsWith(`${input.title.project}${TITLE_SEPARATOR}`))
+        ? nativeSessionTitle(input.title.project, input.title.session)
+        : thread.title;
+    if (!unsettle && title === thread.title && input.working === (startedAt !== null)) return;
+    yield* eventSink.write({
+      events: [
+        {
+          id: EventId.make(
+            `${IMPORT_EVENT_PREFIX}:presented:${input.threadId}:${DateTime.toEpochMillis(now)}`,
+          ),
+          type: unsettle ? "thread.unsettled" : "thread.metadata-updated",
+          threadId: input.threadId,
+          providerInstanceId: thread.providerInstanceId,
+          occurredAt: now,
+          payload: {
+            ...thread,
+            title,
+            outsideTurnStartedAt: input.working ? (startedAt ?? now) : null,
+            ...(unsettle ? { settledOverride: null, settledAt: null, unsettledAt: now } : {}),
+            updatedAt: now,
+          },
+        },
+      ],
+    });
+  });
+
+  /**
+   * Ends the working state of threads whose terminal turn is over. A turn's end
+   * does not always touch the transcript, so this also runs when Claude's
+   * process files change and on every full pass.
+   */
+  const settleFinishedOutsideTurns: Effect.Effect<void> = Effect.gen(function* () {
+    const marked = yield* sql<{
+      readonly threadId: string;
+      readonly driver: string | null;
+      readonly nativeId: string | null;
+    }>`
+      SELECT
+        thread.thread_id AS "threadId",
+        provider_thread.driver AS "driver",
+        json_extract(provider_thread.payload_json, '$.nativeThreadRef.nativeId') AS "nativeId"
+      FROM orchestration_v2_projection_threads AS thread
+      LEFT JOIN orchestration_v2_projection_provider_threads AS provider_thread
+        ON provider_thread.provider_thread_id =
+          json_extract(thread.payload_json, '$.activeProviderThreadId')
+      WHERE json_extract(thread.payload_json, '$.outsideTurnStartedAt') IS NOT NULL
+    `;
+    if (marked.length === 0) return;
+    busyClaudeCache.clear();
+    const busyClaude = new Set<string>();
+    for (const configDir of claudeConfigDirs) {
+      for (const sessionId of yield* busyClaudeSessions(configDir)) busyClaude.add(sessionId);
+    }
+    const now = yield* Clock.currentTimeMillis;
+    for (const row of marked) {
+      const threadId = ThreadId.make(row.threadId);
+      let working = false;
+      if (row.driver === "claudeAgent") {
+        working = row.nativeId !== null && busyClaude.has(row.nativeId);
+      } else if (row.driver === "codex") {
+        // Codex ends a turn in the transcript, which the sync reads. Only a turn
+        // that was cut off needs ending here.
+        const runtime = yield* runtimes.getByThreadId({ threadId });
+        const filePath = Option.isNone(runtime)
+          ? undefined
+          : Option.getOrUndefined(decodeImportedTranscriptPayload(runtime.value.runtimePayload))
+              ?.importedTranscripts?.[0]?.filePath;
+        const modifiedAt =
+          filePath === undefined
+            ? null
+            : yield* fileSystem.stat(filePath).pipe(
+                Effect.map((info) => Option.getOrNull(info.mtime)?.getTime() ?? null),
+                Effect.orElseSucceed(() => null),
+              );
+        working = modifiedAt !== null && now - modifiedAt < STALLED_TURN_MS;
+      }
+      if (!working) {
+        yield* presentNativeSession({ threadId, working: false, continuedOutside: false });
+      }
+    }
+  }).pipe(
+    Effect.catchCause((cause) =>
+      Effect.logDebug("Could not settle finished terminal turns", { cause }),
+    ),
+  );
 
   const importRecentAgentThreads = Effect.fn("importRecentAgentThreadsV2")(function* (
     input: AgentSessionImportInput,
@@ -382,9 +542,28 @@ const make = Effect.gen(function* () {
           (cause) => new AgentSessionScanError({ operation: "read-projects", cause }),
         ),
       );
+    // Threads mirrored before titles led with the project are read once more to be retitled.
+    const untitled = new Set(
+      (yield* sql<{ readonly threadId: string }>`
+        SELECT thread.thread_id AS "threadId"
+        FROM orchestration_v2_projection_threads AS thread
+        WHERE thread.project_id = ${input.projectId}
+          AND thread.thread_id LIKE 'import:%'
+          AND instr(thread.title, ${TITLE_SEPARATOR}) = 0
+          AND NOT EXISTS (
+            SELECT 1 FROM orchestration_v2_projection_runs AS run
+            WHERE run.thread_id = thread.thread_id
+          )
+      `.pipe(
+        Effect.mapError(
+          (cause) => new AgentSessionScanError({ operation: "read-projects", cause }),
+        ),
+      )).map((row) => row.threadId),
+    );
     const completedSources = runtimeRows.flatMap((runtime) => {
       const payload = decodeImportedTranscriptPayload(runtime.runtimePayload);
       if (
+        untitled.has(runtime.threadId) ||
         Option.isNone(payload) ||
         payload.value.cwd === undefined ||
         normalizeProjectPathForComparison(payload.value.cwd) !==
@@ -469,7 +648,15 @@ const make = Effect.gen(function* () {
             }
             yield* persistRuntime;
             // Leaving the transcript unrecorded makes the next pass read it again.
-            if (!(yield* appendOutsideTurns({ threadId, thread }))) return true;
+            const appended = yield* appendOutsideTurns({ threadId, thread });
+            if (appended === null) return true;
+            yield* presentNativeSession({
+              threadId,
+              working: yield* outsideTurnOpen({ thread, source }),
+              continuedOutside: appended > 0,
+              title: { project: project.title, session: thread.title },
+              lastActiveAt: dateTime(thread.updatedAt),
+            });
             yield* runtimes.recordImportedTranscript({ threadId, source });
             return true;
           }
@@ -482,12 +669,17 @@ const make = Effect.gen(function* () {
           });
           const createdAt = dateTime(thread.createdAt);
           const updatedAt = dateTime(thread.updatedAt);
+          const working = yield* outsideTurnOpen({ thread, source });
+          const recent =
+            working ||
+            (yield* Clock.currentTimeMillis) - DateTime.toEpochMillis(updatedAt) <
+              RECENT_SESSION_MS;
           const appThread: OrchestrationV2AppThread = {
             createdBy: "system",
             creationSource: "server",
             id: threadId,
             projectId: input.projectId,
-            title: thread.title.trim() === "" ? "Untitled thread" : thread.title,
+            title: nativeSessionTitle(project.title, thread.title),
             providerInstanceId: thread.providerInstanceId,
             modelSelection: { instanceId: thread.providerInstanceId, model },
             runtimeMode,
@@ -507,9 +699,10 @@ const make = Effect.gen(function* () {
             createdAt,
             updatedAt,
             archivedAt: null,
-            settledOverride: "settled",
-            settledAt: updatedAt,
-            unsettledAt: null,
+            ...(recent
+              ? { settledOverride: null, settledAt: null, unsettledAt: updatedAt }
+              : { settledOverride: "settled" as const, settledAt: updatedAt, unsettledAt: null }),
+            ...(working ? { outsideTurnStartedAt: updatedAt } : {}),
             snoozedUntil: null,
             snoozedAt: null,
             pinnedAt: null,
@@ -599,7 +792,18 @@ const make = Effect.gen(function* () {
             const ownerId = yield* findNativeOwner(thread, nativeThreadId);
             const owner = ownerId === undefined ? null : ThreadId.make(ownerId);
             if (owner !== null) {
-              yield* appendOutsideTurns({ threadId: owner, thread, namedWritersOnly: true });
+              const appended = yield* appendOutsideTurns({
+                threadId: owner,
+                thread,
+                namedWritersOnly: true,
+              });
+              if (appended !== null) {
+                yield* presentNativeSession({
+                  threadId: owner,
+                  working: yield* outsideTurnOpen({ thread, source }),
+                  continuedOutside: appended > 0,
+                });
+              }
             }
             markNative(source.filePath, owner);
             return null;
@@ -649,6 +853,23 @@ const make = Effect.gen(function* () {
     const transcriptRoots = yield* scanner.refreshCandidates;
     lastFullSyncAt = yield* Clock.currentTimeMillis;
     for (const root of transcriptRoots) {
+      // Claude's process files sit beside its transcripts and change when a turn ends.
+      const processDir =
+        path.basename(root) === "projects" ? path.join(path.dirname(root), "sessions") : null;
+      if (processDir !== null) claudeConfigDirs.add(path.dirname(root));
+      if (watchWanted && processDir !== null && !watchedRoots.has(processDir)) {
+        watchedRoots.add(processDir);
+        yield* fileSystem.watch(processDir).pipe(
+          Stream.debounce(PROCESS_CHANGE_DEBOUNCE),
+          Stream.runForEach(() => settleFinishedOutsideTurns),
+          Effect.catchCause((cause) =>
+            Effect.logDebug("Agent process watch stopped", { processDir, cause }).pipe(
+              Effect.andThen(Effect.sync(() => watchedRoots.delete(processDir))),
+            ),
+          ),
+          Effect.forkIn(serviceScope),
+        );
+      }
       if (!watchWanted || watchedRoots.has(root)) continue;
       watchedRoots.add(root);
       yield* fileSystem.watch(root, { recursive: true }).pipe(
@@ -692,6 +913,7 @@ const make = Effect.gen(function* () {
       }
       cursor = page.nextCursor;
     }
+    yield* settleFinishedOutsideTurns;
     return imported;
   });
 

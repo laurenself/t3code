@@ -1658,9 +1658,11 @@ export function threadShellFromProjection(
       ),
     activeRunId: activeRun?.id ?? null,
     blockedOnThreadWait: deriveBlockedOnThreadWait({ activeRun, turnItems: projection.turnItems }),
-    activityRunStatus: activityRun?.status ?? null,
-    activityRunStartedAt:
-      activityRun === null ? null : orchestrationV2RunWorkStartedAt(activityRun),
+    ...withOutsideTurn(projection.thread, {
+      activityRunStatus: activityRun?.status ?? null,
+      activityRunStartedAt:
+        activityRun === null ? null : orchestrationV2RunWorkStartedAt(activityRun),
+    }),
     status: latestRun?.status ?? "idle",
     ...threadErrorSummary(
       latestRootProviderFailure(latestRun, projection.turnItems),
@@ -1890,6 +1892,26 @@ function visibleItemCountForShell(input: {
   );
 }
 
+/**
+ * A turn the native session runs in a terminal has no run here. The thread still
+ * reads as working, so clients shelve it with the threads T3 Code is running.
+ */
+function withOutsideTurn<Status extends string>(
+  thread: Pick<OrchestrationV2AppThread, "outsideTurnStartedAt">,
+  activity: {
+    readonly activityRunStatus: Status | null;
+    readonly activityRunStartedAt: DateTime.Utc | null;
+  },
+): {
+  readonly activityRunStatus: Status | "running" | null;
+  readonly activityRunStartedAt: DateTime.Utc | null;
+} {
+  const startedAt = thread.outsideTurnStartedAt ?? null;
+  return activity.activityRunStatus !== null || startedAt === null
+    ? activity
+    : { activityRunStatus: "running", activityRunStartedAt: startedAt };
+}
+
 function shellFromState(input: {
   readonly state: ShellThreadState;
   readonly visibleItemCount: number;
@@ -1935,8 +1957,10 @@ function shellFromState(input: {
     latestRunStopRequested: input.state.latestRunStopRequested,
     activeRunId: input.state.activeRunId,
     blockedOnThreadWait: input.state.blockedOnThreadWait,
-    activityRunStatus: input.state.activityRunStatus,
-    activityRunStartedAt: input.state.activityRunStartedAt,
+    ...withOutsideTurn(input.state.thread, {
+      activityRunStatus: input.state.activityRunStatus,
+      activityRunStartedAt: input.state.activityRunStartedAt,
+    }),
     status: input.state.latestRunStatus,
     lastError: input.state.lastError,
     lastErrorClass: input.state.lastErrorClass,

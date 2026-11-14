@@ -15,6 +15,17 @@ started in T3 Code can be resumed in a terminal once T3 Code has let go of it
 (up to 30 minutes after its last turn), and terminal turns on it are not shown
 in the thread.
 
+## In the thread list
+
+A session a terminal is running a turn on sits under **Working**. When the turn
+ends it returns to the list like any finished thread. A session that was last
+active more than a day before T3 Code first saw it starts under **Settled**;
+anything a terminal adds to it later brings it back.
+
+The thread list does not show folders, so these threads are titled
+`<project> · <session title>`. The title follows the session's own title until
+you run a turn on the thread from T3 Code; after that a title you give it stays.
+
 ## What you need
 
 - The session ran inside a folder you added to T3 Code as a project. A thread

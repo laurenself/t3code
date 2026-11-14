@@ -199,6 +199,8 @@ export interface AgentSessionThread {
   readonly updatedAt: string;
   readonly messages: ReadonlyArray<AgentSessionThreadMessage>;
   readonly omittedMessageCount: number;
+  /** The transcript ends inside a turn. Absent when the transcript does not mark turns. */
+  readonly turnOpen?: boolean;
 }
 
 export type AgentSessionRecentThread =
@@ -395,9 +397,24 @@ function codexHistoryBase(records: ReadonlyArray<DecodedTranscriptRecord>) {
     : undefined;
 }
 
+const CODEX_TURN_END: ReadonlySet<string> = new Set(["task_complete", "turn_aborted"]);
+const HARNESS_MESSAGE =
+  /^(<(command-name|command-message|command-args|local-command-[a-z]+|task-notification|system-reminder)>|Caveat: The messages below were generated)/;
+const MARKUP_ONLY_LINE = /^<\/?[a-zA-Z][\w-]*(\s[^>]*)?>$/;
+
 function deriveTitle(source: AgentSessionSource, text: string): string | undefined {
   const request = source === "codex" ? text.replace(CODEX_TITLE_PREAMBLE, "") : text;
-  return request.trim().split("\n")[0]?.slice(0, 100).trim() || undefined;
+  // Slash commands and harness notices are stored as user messages; they name nothing.
+  if (HARNESS_MESSAGE.test(request.trimStart())) return undefined;
+  return (
+    request
+      .split("\n")
+      .map((line) => line.trim())
+      // A paste arrives wrapped in tags; its first line of content is the title.
+      .find((line) => line.length > 0 && !MARKUP_ONLY_LINE.test(line))
+      ?.slice(0, 100)
+      .trim() || undefined
+  );
 }
 
 // Pi keeps abandoned branches in the file; its active branch runs from the last entry to the root.
@@ -528,6 +545,7 @@ function parseAgentSessionRecords(
   }
 
   let conversationMessageCount = 0;
+  let turnOpen: boolean | undefined;
   const retainMessage = (
     message: AgentSessionThreadMessage & { readonly codexResponseUser: boolean },
   ) => {
@@ -596,6 +614,14 @@ function parseAgentSessionRecords(
         providerSessionId = sessionId;
         hasCodexSessionId = true;
       }
+      continue;
+    }
+    if (record.type === "event_msg" && record.payload?.type === "task_started") {
+      turnOpen = true;
+      continue;
+    }
+    if (record.type === "event_msg" && CODEX_TURN_END.has(record.payload?.type ?? "")) {
+      turnOpen = false;
       continue;
     }
     if (record.type === "turn_context" && record.payload?.model?.trim()) {
@@ -668,6 +694,7 @@ function parseAgentSessionRecords(
     updatedAt: fallbackTimestamp,
     messages: retainedMessages,
     omittedMessageCount: conversationMessageCount - retainedMessages.length,
+    ...(turnOpen === undefined ? {} : { turnOpen }),
   };
 }
 
@@ -697,7 +724,10 @@ function shouldRetainDecodedRecord(
   return (
     record.type === "session_meta" ||
     record.type === "turn_context" ||
-    (record.type === "event_msg" && record.payload?.type === "user_message") ||
+    (record.type === "event_msg" &&
+      (record.payload?.type === "user_message" ||
+        record.payload?.type === "task_started" ||
+        CODEX_TURN_END.has(record.payload?.type ?? ""))) ||
     (record.type === "response_item" &&
       record.payload?.type === "message" &&
       (record.payload.role === "user" || record.payload.role === "assistant"))

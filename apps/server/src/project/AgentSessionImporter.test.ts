@@ -20,6 +20,7 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as TestClock from "effect/testing/TestClock";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/sql/SqlClient";
 
@@ -557,4 +558,51 @@ it.effect("appends turns a session gained outside T3, once, and leaves out the o
     expect(yield* importer.run).toEqual({ importedCount: 1, skippedCount: 0 });
     expect(yield* texts).toEqual(["Fix it", "Fixed", "From the terminal", "Terminal reply"]);
   }).pipe(Effect.scoped, Effect.provide(persistence)),
+);
+
+it.effect(
+  "files an old session under Settled, keeps a recent one out, and titles both by project",
+  () =>
+    Effect.gen(function* () {
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const old = candidate(CODEX_MODEL_SELECTION, "old");
+      const base = candidate(CODEX_MODEL_SELECTION, "recent");
+      yield* TestClock.setTime(Date.parse("2026-09-10T10:00:00.000Z"));
+      const recentAt = Date.parse("2026-09-10T09:00:00.000Z");
+      const recent = {
+        ...base,
+        source: { ...base.source, mtimeMs: recentAt },
+        thread: {
+          ...base.thread,
+          updatedAt: DateTime.formatIso(DateTime.makeUnsafe(recentAt)),
+          turnOpen: true,
+        },
+      };
+      const importer = yield* makeImporter([old, recent]);
+      expect(yield* importer.run).toEqual({ importedCount: 2, skippedCount: 0 });
+
+      const filed = yield* projections.getThread(importId(old));
+      expect(filed.settledOverride).toBe("settled");
+      expect(filed.title).toBe("Project · Imported thread");
+      const live = yield* projections.getThread(importId(recent));
+      expect(live.settledOverride).toBeNull();
+      expect(live.settledAt).toBeNull();
+      expect(live.outsideTurnStartedAt ?? null).toBeNull();
+
+      // A turn that is still being written marks the thread working, and it loads again after.
+      yield* TestClock.setTime(Date.parse("2026-09-10T09:05:00.000Z"));
+      const open = candidate(CODEX_MODEL_SELECTION, "open");
+      const running = yield* makeImporter([
+        {
+          ...open,
+          source: { ...open.source, mtimeMs: recentAt },
+          thread: { ...open.thread, updatedAt: recent.thread.updatedAt, turnOpen: true },
+        },
+      ]);
+      expect(yield* running.run).toEqual({ importedCount: 1, skippedCount: 0 });
+      expect((yield* projections.getThread(importId(open))).outsideTurnStartedAt).toBeDefined();
+      expect(
+        (yield* projections.getThreadRecords(importId(open), [])).thread.outsideTurnStartedAt,
+      ).not.toBeNull();
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
 );

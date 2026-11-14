@@ -26,6 +26,36 @@ const T3_ENTRYPOINT = "t3-code";
 const EXIT_POLL = Duration.millis(100);
 const EXIT_POLLS = 50;
 
+/**
+ * The sessions a terminal is running a turn on right now. T3 Code's own Claude
+ * processes are left out.
+ */
+export const busyClaudeTerminalSessions = Effect.fn("busyClaudeTerminalSessions")(function* (
+  configDir: string,
+) {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const directory = path.join(configDir, "sessions");
+  const names = yield* fileSystem.readDirectory(directory).pipe(Effect.orElseSucceed(() => []));
+  const busy = new Set<string>();
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue;
+    const record = yield* fileSystem.readFileString(path.join(directory, name)).pipe(
+      Effect.map(decodeRecord),
+      Effect.orElseSucceed(() => Option.none()),
+    );
+    if (
+      Option.isSome(record) &&
+      record.value.status === "busy" &&
+      record.value.entrypoint !== T3_ENTRYPOINT &&
+      isProcessAlive(record.value.pid)
+    ) {
+      busy.add(record.value.sessionId);
+    }
+  }
+  return busy;
+});
+
 export type ClaudeTerminalClaim =
   | { readonly _tag: "Free" }
   /** A terminal is running a turn on the session; taking it would cut that turn off. */

@@ -6,6 +6,15 @@ messages you send from T3 Code are added to the same session, and turns you run
 in the terminal appear in the thread a few seconds later. You can move between
 your phone and the terminal on one conversation.
 
+## Threads you started in T3 Code
+
+It works the other way too for Claude: a thread you started in T3 Code is an
+ordinary Claude Code session, so `claude --resume <session id>` continues it in
+a terminal, and the turns you run there appear in the thread. A Codex thread
+started in T3 Code can be resumed in a terminal once T3 Code has let go of it
+(up to 30 minutes after its last turn), and terminal turns on it are not shown
+in the thread.
+
 ## What you need
 
 - The session ran inside a folder you added to T3 Code as a project. A thread

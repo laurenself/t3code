@@ -39,6 +39,7 @@ import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
+import * as SqlClient from "effect/sql/SqlClient";
 
 import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -220,18 +221,35 @@ const make = Effect.gen(function* () {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const turnItemPositions = yield* TurnItemPositionStore.TurnItemPositionStoreV2;
+  const sql = yield* SqlClient.SqlClient;
   const runtimes = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
   const settingsService = yield* ServerSettings.ServerSettingsService;
   const ceiling = settingsService.managedPolicy?.limits?.maxRuntimeMode;
   // Transcripts of threads T3 itself runs. Their turns rewrite the file constantly, so
   // without this every sync tick would re-read them only to find them owned again.
-  const nativeTranscripts = new Set<string>();
-  const markNative = (filePath: string) => {
+  const nativeTranscripts = new Map<string, ThreadId | null>();
+  // Native transcripts that changed while T3 had no run on them: a terminal may have
+  // continued the session, so the next pass reads them once.
+  const changedNativeTranscripts = new Set<string>();
+  const markNative = (filePath: string, owner: ThreadId | null) => {
     if (nativeTranscripts.size >= MAX_IGNORED_TRANSCRIPTS) nativeTranscripts.clear();
-    nativeTranscripts.add(filePath);
+    nativeTranscripts.set(filePath, owner);
+    changedNativeTranscripts.delete(filePath);
   };
   const skipTranscript = (transcript: { readonly filePath: string }) =>
-    nativeTranscripts.has(transcript.filePath);
+    nativeTranscripts.has(transcript.filePath) &&
+    !changedNativeTranscripts.has(transcript.filePath);
+  /** The thread T3 itself started on this native session, if any. */
+  const findNativeOwner = (thread: AgentSessionScanner.AgentSessionThread, nativeId: string) =>
+    sql<{ readonly threadId: string }>`
+      SELECT thread_id AS "threadId"
+      FROM orchestration_v2_projection_provider_threads
+      WHERE driver = ${thread.source}
+        AND provider_instance_id = ${thread.providerInstanceId}
+        AND thread_id IS NOT NULL
+        AND json_extract(payload_json, '$.nativeThreadRef.nativeId') = ${nativeId}
+      LIMIT 1
+    `.pipe(Effect.map((rows) => rows[0]?.threadId));
   // Which project each transcript belongs to, so a change to one file syncs one project.
   const transcriptProjects = new Map<string, ProjectId>();
   /**
@@ -243,6 +261,11 @@ const make = Effect.gen(function* () {
   const appendOutsideTurns = Effect.fn("appendOutsideAgentTurnsV2")(function* (input: {
     readonly threadId: ThreadId;
     readonly thread: AgentSessionScanner.AgentSessionThread;
+    /**
+     * Take only records whose writer the transcript names. A thread T3 started
+     * has no imported history to tell its own early records from a terminal's.
+     */
+    readonly namedWritersOnly?: boolean;
   }) {
     const records = yield* orchestrator.getThreadRecords(input.threadId, [
       "messages",
@@ -268,6 +291,7 @@ const make = Effect.gen(function* () {
       if (message.writtenByT3 === true || message.createdAt === input.thread.updatedAt) {
         return false;
       }
+      if (input.namedWritersOnly === true && message.writtenByT3 === undefined) return false;
       const at = millis(dateTime(message.createdAt));
       if (at <= mirroredThrough) return false;
       // Without the writer's name, a record written while T3 ran a turn is taken as T3's.
@@ -571,7 +595,13 @@ const make = Effect.gen(function* () {
             ],
           });
           if (committed.length === 0) {
-            markNative(source.filePath);
+            // A thread started in T3 owns this session. A terminal may have continued it.
+            const ownerId = yield* findNativeOwner(thread, nativeThreadId);
+            const owner = ownerId === undefined ? null : ThreadId.make(ownerId);
+            if (owner !== null) {
+              yield* appendOutsideTurns({ threadId: owner, thread, namedWritersOnly: true });
+            }
+            markNative(source.filePath, owner);
             return null;
           }
           yield* persistRuntime;
@@ -673,8 +703,18 @@ const make = Effect.gen(function* () {
     const projectIds = new Set<ProjectId>();
     const unplaced: Array<string> = [];
     for (const filePath of changed) {
-      if (nativeTranscripts.has(filePath)) continue;
       const projectId = transcriptProjects.get(filePath);
+      if (nativeTranscripts.has(filePath)) {
+        const owner = nativeTranscripts.get(filePath);
+        if (projectId === undefined || owner === undefined || owner === null) continue;
+        // T3's own turn is what is writing the file; nothing to read until it settles.
+        const running = yield* orchestrator.getThreadRecords(owner, ["runs"]).pipe(
+          Effect.map((records) => records.runs.some((run) => OPEN_RUN_STATUSES.has(run.status))),
+          Effect.orElseSucceed(() => true),
+        );
+        if (running) continue;
+        changedNativeTranscripts.add(filePath);
+      }
       if (projectId !== undefined) {
         projectIds.add(projectId);
       } else if (now - (unplacedTranscripts.get(filePath) ?? 0) >= UNPLACED_TRANSCRIPT_RETRY_MS) {

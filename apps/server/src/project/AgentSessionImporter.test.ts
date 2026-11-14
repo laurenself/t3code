@@ -25,6 +25,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 
 import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as EventStore from "../orchestration-v2/EventStore.ts";
+import * as ProviderSessionManager from "../orchestration-v2/ProviderSessionManager.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import {
@@ -240,6 +241,9 @@ const makeImporter = Effect.fn(function* (
                 ),
               ),
             refreshCandidates: Effect.succeed([]),
+          }),
+          Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+            detach: () => Effect.void,
           }),
           Layer.mock(ProjectService.ProjectService)({
             getById: () => Effect.succeedSome(project),
@@ -536,7 +540,7 @@ it.effect("appends turns a session gained outside T3, once, and leaves out the o
             role: "user" as const,
             text: "Sent from T3",
             createdAt: "2026-09-01T10:06:00.000Z",
-            writtenBySdk: true as const,
+            writtenByT3: true,
           },
         ],
       },

@@ -43,6 +43,7 @@ import * as Stream from "effect/Stream";
 import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
+import * as ProviderSessionManager from "../orchestration-v2/ProviderSessionManager.ts";
 import * as TurnItemPositionStore from "../orchestration-v2/TurnItemPositionStore.ts";
 import * as ProviderSessionRuntime from "../persistence/ProviderSessionRuntime.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -215,6 +216,7 @@ const make = Effect.gen(function* () {
   const projects = yield* ProjectService.ProjectService;
   const eventSink = yield* EventSink.EventSinkV2;
   const idAllocator = yield* IdAllocator.IdAllocatorV2;
+  const providerSessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const turnItemPositions = yield* TurnItemPositionStore.TurnItemPositionStoreV2;
@@ -242,7 +244,11 @@ const make = Effect.gen(function* () {
     readonly threadId: ThreadId;
     readonly thread: AgentSessionScanner.AgentSessionThread;
   }) {
-    const records = yield* orchestrator.getThreadRecords(input.threadId, ["messages", "runs"]);
+    const records = yield* orchestrator.getThreadRecords(input.threadId, [
+      "messages",
+      "runs",
+      "providerSessions",
+    ]);
     if (records.runs.some((run) => OPEN_RUN_STATUSES.has(run.status))) return false;
     const millis = (value: DateTime.Utc) => DateTime.toEpochMillis(value);
     const runWindows = records.runs.map((run) => ({
@@ -259,12 +265,18 @@ const make = Effect.gen(function* () {
     const seen = new Set<string>();
     const outside = input.thread.messages.filter((message) => {
       // A record with no timestamp of its own takes the file's, which moves on every read.
-      if (message.writtenBySdk === true || message.createdAt === input.thread.updatedAt) {
+      if (message.writtenByT3 === true || message.createdAt === input.thread.updatedAt) {
         return false;
       }
       const at = millis(dateTime(message.createdAt));
       if (at <= mirroredThrough) return false;
-      if (runWindows.some((window) => at >= window.from && at <= window.to)) return false;
+      // Without the writer's name, a record written while T3 ran a turn is taken as T3's.
+      if (
+        message.writtenByT3 === undefined &&
+        runWindows.some((window) => at >= window.from && at <= window.to)
+      ) {
+        return false;
+      }
       const key = syncedMessageKey(message);
       if (seen.has(key)) return false;
       seen.add(key);
@@ -290,6 +302,17 @@ const make = Effect.gen(function* () {
       }
     }
     yield* eventSink.write({ events });
+    // An agent process T3 still holds for this thread loaded the session before
+    // these turns. Letting it go makes the next message resume from the transcript.
+    for (const session of records.providerSessions) {
+      yield* providerSessions
+        .detach({
+          providerSessionId: session.id,
+          threadId: input.threadId,
+          detail: "The session continued outside T3 Code.",
+        })
+        .pipe(Effect.ignore);
+    }
     return true;
   });
 

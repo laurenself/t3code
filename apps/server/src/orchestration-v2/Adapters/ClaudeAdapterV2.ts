@@ -83,6 +83,7 @@ import {
 } from "@t3tools/shared/mcpApp";
 import { AgentScope } from "@t3tools/shared/AgentScope";
 import * as HostProcess from "@t3tools/shared/HostProcess";
+import { claimClaudeSession } from "../../provider/Drivers/ClaudeTerminalSessions.ts";
 import { applyClaudePromptEffortPrefix } from "@t3tools/shared/model";
 import {
   CLAUDE_RESUME_COMPACTION_COMPACT_ANSWER,
@@ -11934,6 +11935,30 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           resumeThread: Effect.fn("ClaudeAdapterV2.resumeThread")(
             function* (threadInput: { readonly providerThread: OrchestrationV2ProviderThread }) {
               const nativeThreadId = threadInput.providerThread.nativeThreadRef?.nativeId;
+              if (nativeThreadId !== undefined && nativeThreadId !== null) {
+                const claim = yield* claimClaudeSession({
+                  configDir: claudeConfigDirOf(
+                    path,
+                    adapterOptions.environment,
+                    yield* HostProcess.HomeDirectory,
+                  ),
+                  sessionId: nativeThreadId,
+                }).pipe(
+                  Effect.provideService(FileSystem.FileSystem, fileSystem),
+                  Effect.provideService(Path.Path, path),
+                );
+                if (claim._tag !== "Free") {
+                  return yield* new ProviderAdapter.ProviderAdapterThreadInUseError({
+                    driver: CLAUDE_PROVIDER,
+                    providerThreadId: threadInput.providerThread.id,
+                    detail:
+                      claim._tag === "Busy"
+                        ? `This session is running a turn in a terminal (pid ${claim.pid}). Wait for it to finish or stop it there, then send the message again.`
+                        : `A terminal still has this session open (pid ${claim.pid}) and did not close. Quit Claude Code there, then send the message again.`,
+                    cause: claim,
+                  });
+                }
+              }
               if (
                 nativeThreadId !== undefined &&
                 nativeThreadId !== null &&
@@ -11968,14 +11993,15 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             },
             (effect, threadInput) =>
               effect.pipe(
-                Effect.mapError(
-                  (cause) =>
-                    new ProviderAdapter.ProviderAdapterResumeThreadError({
-                      driver: CLAUDE_PROVIDER,
-                      providerSessionId: input.providerSessionId,
-                      providerThreadId: threadInput.providerThread.id,
-                      cause,
-                    }),
+                Effect.mapError((cause) =>
+                  cause._tag === "ProviderAdapterThreadInUseError"
+                    ? cause
+                    : new ProviderAdapter.ProviderAdapterResumeThreadError({
+                        driver: CLAUDE_PROVIDER,
+                        providerSessionId: input.providerSessionId,
+                        providerThreadId: threadInput.providerThread.id,
+                        cause,
+                      }),
                 ),
               ),
           ),

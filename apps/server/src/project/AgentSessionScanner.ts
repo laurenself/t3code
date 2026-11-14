@@ -90,6 +90,9 @@ const GIT_FILE_READ_CONCURRENCY = 16;
 const BLOCKED_GIT_FILE_RETRY_MS = 5 * 60 * 1000;
 const MAX_BLOCKED_GIT_FILE_PATHS = 1024;
 
+/** The `entrypoint` Claude Code records for turns T3 runs. */
+const T3_CLAUDE_ENTRYPOINT = "t3-code";
+
 const TranscriptContentBlock = Schema.Struct({
   type: Schema.optional(Schema.String),
   text: Schema.optional(Schema.String),
@@ -119,7 +122,7 @@ const TranscriptRecord = Schema.Struct({
   isSidechain: Schema.optional(Schema.Boolean),
   isMeta: Schema.optional(Schema.Boolean),
   isCompactSummary: Schema.optional(Schema.Boolean),
-  // Claude stamps each record with the client that wrote it: "cli" in a terminal, "sdk-*" under T3.
+  // Claude stamps each record with the client that wrote it: "cli" in a terminal, "t3-code" under T3.
   entrypoint: Schema.optional(Schema.String),
   message: Schema.optional(TranscriptMessage),
   payload: Schema.optional(
@@ -179,8 +182,11 @@ export interface AgentSessionThreadMessage {
   readonly role: "user" | "assistant";
   readonly text: string;
   readonly createdAt: string;
-  /** Set when an SDK client wrote the record, which on a session T3 resumes is T3 itself. */
-  readonly writtenBySdk?: true;
+  /**
+   * Whether T3 wrote the record while running a turn on this session. Absent
+   * when the transcript does not say who wrote it.
+   */
+  readonly writtenByT3?: boolean;
 }
 
 export interface AgentSessionThread {
@@ -577,7 +583,9 @@ function parseAgentSessionRecords(
         text,
         createdAt: normalizeTimestamp(record.timestamp, fallbackTimestamp),
         codexResponseUser: false,
-        ...(record.entrypoint?.startsWith("sdk") === true ? { writtenBySdk: true as const } : {}),
+        ...(record.entrypoint === undefined
+          ? {}
+          : { writtenByT3: record.entrypoint === T3_CLAUDE_ENTRYPOINT }),
       });
       continue;
     }

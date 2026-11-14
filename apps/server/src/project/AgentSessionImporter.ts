@@ -40,9 +40,11 @@ import * as Stream from "effect/Stream";
 import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
+import * as TurnItemPositionStore from "../orchestration-v2/TurnItemPositionStore.ts";
 import * as ProviderSessionRuntime from "../persistence/ProviderSessionRuntime.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as AgentSessionScanner from "./AgentSessionScanner.ts";
+import { nativeSessionThreadId } from "./nativeSessionThread.ts";
 import * as ProjectService from "./ProjectService.ts";
 
 const IMPORT_EVENT_PREFIX = "agent-session-import:v2";
@@ -55,6 +57,16 @@ const DEFAULT_SYNC_INTERVAL = Duration.minutes(2);
 const SYNC_STARTUP_DELAY = Duration.seconds(20);
 const SYNC_PROJECT_PAGE_SIZE = 100;
 const MAX_IGNORED_TRANSCRIPTS = 10_000;
+/** A run that can still write to its native session. */
+const OPEN_RUN_STATUSES: ReadonlySet<string> = new Set([
+  "preparing",
+  "queued",
+  "starting",
+  "running",
+  "waiting",
+]);
+/** Transcript records land slightly outside the run that wrote them. */
+const RUN_WINDOW_SLACK_MS = 2_000;
 const CLAUDE_SESSION_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const decodeImportedTranscriptPayload = Schema.decodeUnknownOption(
@@ -102,13 +114,22 @@ function dateTime(value: string): DateTime.Utc {
   return DateTime.makeUnsafe(value);
 }
 
-function messageEvents(input: {
-  readonly threadId: ThreadId;
-  readonly index: number;
-  readonly message: AgentSessionScanner.AgentSessionThreadMessage;
-}): ReadonlyArray<OrchestrationV2DomainEvent> {
-  const ordinal = input.index + 1;
-  const suffix = String(input.index).padStart(6, "0");
+/**
+ * Names a turn the transcript gained after the import. The transcript is
+ * append-only, so a record keeps its timestamp and role on every read.
+ */
+function syncedMessageKey(message: AgentSessionScanner.AgentSessionThreadMessage): string {
+  return `sync:${message.createdAt}:${message.role}`;
+}
+
+function messageEvents(
+  input: {
+    readonly threadId: ThreadId;
+    readonly message: AgentSessionScanner.AgentSessionThreadMessage;
+  } & ({ readonly index: number } | { readonly key: string }),
+): ReadonlyArray<OrchestrationV2DomainEvent> {
+  const ordinal = "index" in input ? input.index + 1 : 1;
+  const suffix = "index" in input ? String(input.index).padStart(6, "0") : input.key;
   const messageId = MessageId.make(`${input.threadId}:${suffix}`);
   const turnItemId = TurnItemId.make(
     `${IMPORT_EVENT_PREFIX}:turn-item:${input.threadId}:${suffix}`,
@@ -187,6 +208,7 @@ const make = Effect.gen(function* () {
   const projects = yield* ProjectService.ProjectService;
   const eventSink = yield* EventSink.EventSinkV2;
   const idAllocator = yield* IdAllocator.IdAllocatorV2;
+  const turnItemPositions = yield* TurnItemPositionStore.TurnItemPositionStoreV2;
   const runtimes = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
   const settingsService = yield* ServerSettings.ServerSettingsService;
   const ceiling = settingsService.managedPolicy?.limits?.maxRuntimeMode;
@@ -199,6 +221,67 @@ const make = Effect.gen(function* () {
   };
   const skipTranscript = (transcript: { readonly filePath: string }) =>
     nativeTranscripts.has(transcript.filePath);
+  /**
+   * Appends the turns a native session gained outside T3 (in a terminal) to the
+   * thread that mirrors it. Turns T3 ran itself are already in the thread as
+   * runs, so records written inside a run are left out. Returns false while a
+   * run is open: its records are still arriving, and the next pass reads them.
+   */
+  const appendOutsideTurns = Effect.fn("appendOutsideAgentTurnsV2")(function* (input: {
+    readonly threadId: ThreadId;
+    readonly thread: AgentSessionScanner.AgentSessionThread;
+  }) {
+    const records = yield* orchestrator.getThreadRecords(input.threadId, ["messages", "runs"]);
+    if (records.runs.some((run) => OPEN_RUN_STATUSES.has(run.status))) return false;
+    const millis = (value: DateTime.Utc) => DateTime.toEpochMillis(value);
+    const runWindows = records.runs.map((run) => ({
+      from: millis(run.requestedAt) - RUN_WINDOW_SLACK_MS,
+      to: millis(run.completedAt ?? run.startedAt ?? run.requestedAt) + RUN_WINDOW_SLACK_MS,
+    }));
+    // Everything up to the newest mirrored message is already in the thread.
+    let mirroredThrough = 0;
+    for (const message of records.messages) {
+      if (message.runId === null) {
+        mirroredThrough = Math.max(mirroredThrough, millis(message.createdAt));
+      }
+    }
+    const seen = new Set<string>();
+    const outside = input.thread.messages.filter((message) => {
+      // A record with no timestamp of its own takes the file's, which moves on every read.
+      if (message.writtenBySdk === true || message.createdAt === input.thread.updatedAt) {
+        return false;
+      }
+      const at = millis(dateTime(message.createdAt));
+      if (at <= mirroredThrough) return false;
+      if (runWindows.some((window) => at >= window.from && at <= window.to)) return false;
+      const key = syncedMessageKey(message);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+    if (outside.length === 0) return true;
+
+    const events = outside.flatMap((message) =>
+      messageEvents({ threadId: input.threadId, key: syncedMessageKey(message), message }),
+    );
+    // Items with no run sort ahead of every run. These turns happened after the
+    // thread's runs, so they take the end of the latest run's range instead.
+    const latestRunOrdinal = records.runs.reduce((latest, run) => Math.max(latest, run.ordinal), 0);
+    if (latestRunOrdinal > 0) {
+      for (const event of events) {
+        if (event.type !== "turn-item.updated") continue;
+        yield* turnItemPositions.allocate({
+          threadId: input.threadId,
+          turnItemId: event.payload.id,
+          runId: null,
+          runOrdinal: latestRunOrdinal,
+        });
+      }
+    }
+    yield* eventSink.write({ events });
+    return true;
+  });
+
   const importRecentAgentThreads = Effect.fn("importRecentAgentThreadsV2")(function* (
     input: AgentSessionImportInput,
   ) {
@@ -267,9 +350,7 @@ const make = Effect.gen(function* () {
           return;
         }
         const source = outcome.source;
-        const threadId = ThreadId.make(
-          `import:${source.providerInstanceId}:${source.providerSessionId}`,
-        );
+        const threadId = nativeSessionThreadId(source);
         if (outcome._tag === "AlreadyImported") {
           importedThreadIds.add(threadId);
           importedCount += 1;
@@ -327,6 +408,8 @@ const make = Effect.gen(function* () {
               return yield* new AgentSessionThreadModifiedError({ threadId });
             }
             yield* persistRuntime;
+            // Leaving the transcript unrecorded makes the next pass read it again.
+            if (!(yield* appendOutsideTurns({ threadId, thread }))) return true;
             yield* runtimes.recordImportedTranscript({ threadId, source });
             return true;
           }
@@ -549,4 +632,6 @@ export class AgentSessionImporter extends Context.Service<
   AgentSessionImporterShape
 >()("t3/project/AgentSessionImporter") {}
 
-export const layer = Layer.effect(AgentSessionImporter, make);
+export const layer = Layer.effect(AgentSessionImporter, make).pipe(
+  Layer.provide(TurnItemPositionStore.layer),
+);

@@ -502,3 +502,53 @@ it.effect(
       ).not.toContain(importId(first));
     }).pipe(Effect.scoped, Effect.provide(persistence)),
 );
+
+it.effect("appends turns a session gained outside T3, once, and leaves out the ones T3 wrote", () =>
+  Effect.gen(function* () {
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const original = candidate(CODEX_MODEL_SELECTION, "grows");
+    const threadId = importId(original);
+    let current: ReturnType<typeof candidate> = original;
+    const importer = yield* makeImporter(() => [current]);
+    expect(yield* importer.run).toEqual({ importedCount: 1, skippedCount: 0 });
+
+    const grown = {
+      ...original,
+      source: { ...original.source, size: 300, mtimeMs: 9 },
+      thread: {
+        ...original.thread,
+        updatedAt: "2026-09-01T10:09:00.000Z",
+        messages: [
+          ...original.thread.messages,
+          {
+            role: "user" as const,
+            text: "From the terminal",
+            createdAt: "2026-09-01T10:05:00.000Z",
+          },
+          {
+            role: "assistant" as const,
+            text: "Terminal reply",
+            createdAt: "2026-09-01T10:05:30.000Z",
+          },
+          {
+            role: "user" as const,
+            text: "Sent from T3",
+            createdAt: "2026-09-01T10:06:00.000Z",
+            writtenBySdk: true as const,
+          },
+        ],
+      },
+    };
+    current = grown;
+    const texts = Effect.map(projections.getThreadRecords(threadId, ["messages"]), (records) =>
+      records.messages.map((message) => message.text),
+    );
+    expect(yield* importer.run).toEqual({ importedCount: 1, skippedCount: 0 });
+    expect(yield* texts).toEqual(["Fix it", "Fixed", "From the terminal", "Terminal reply"]);
+
+    // The same transcript read again, as after a restart, adds nothing.
+    current = { ...grown, source: { ...grown.source, size: 301, mtimeMs: 10 } };
+    expect(yield* importer.run).toEqual({ importedCount: 1, skippedCount: 0 });
+    expect(yield* texts).toEqual(["Fix it", "Fixed", "From the terminal", "Terminal reply"]);
+  }).pipe(Effect.scoped, Effect.provide(persistence)),
+);

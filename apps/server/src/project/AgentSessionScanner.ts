@@ -119,6 +119,8 @@ const TranscriptRecord = Schema.Struct({
   isSidechain: Schema.optional(Schema.Boolean),
   isMeta: Schema.optional(Schema.Boolean),
   isCompactSummary: Schema.optional(Schema.Boolean),
+  // Claude stamps each record with the client that wrote it: "cli" in a terminal, "sdk-*" under T3.
+  entrypoint: Schema.optional(Schema.String),
   message: Schema.optional(TranscriptMessage),
   payload: Schema.optional(
     Schema.Struct({
@@ -177,6 +179,8 @@ export interface AgentSessionThreadMessage {
   readonly role: "user" | "assistant";
   readonly text: string;
   readonly createdAt: string;
+  /** Set when an SDK client wrote the record, which on a session T3 resumes is T3 itself. */
+  readonly writtenBySdk?: true;
 }
 
 export interface AgentSessionThread {
@@ -570,6 +574,7 @@ function parseAgentSessionRecords(
         text,
         createdAt: normalizeTimestamp(record.timestamp, fallbackTimestamp),
         codexResponseUser: false,
+        ...(record.entrypoint?.startsWith("sdk") === true ? { writtenBySdk: true as const } : {}),
       });
       continue;
     }

@@ -1,4 +1,5 @@
 import { modelSelectionsEqual } from "@t3tools/shared/model";
+import { isNativeSessionThreadId } from "../project/nativeSessionThread.ts";
 import { projectComposerContextForProvider } from "@t3tools/shared/composerContextReferences";
 import {
   CommandId,
@@ -1334,6 +1335,15 @@ export const layer: Layer.Layer<
         if (
           resumed._tag === "Failure" &&
           resumed.failure._tag === "ProviderAdapterThreadInUseError"
+        ) {
+          return yield* loadFromProvider(Effect.fail(resumed.failure));
+        }
+        // A thread imported from a terminal session is that session. Starting a
+        // fresh one would leave the terminal and T3 on two different conversations.
+        if (
+          resumed._tag === "Failure" &&
+          !uncertainDelivery &&
+          isNativeSessionThreadId(projection.thread.id)
         ) {
           return yield* loadFromProvider(Effect.fail(resumed.failure));
         }

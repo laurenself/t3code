@@ -169,8 +169,21 @@ const seedOwner = Effect.fn(function* (
   return threadId;
 });
 
+const project = {
+  id: projectId,
+  title: "Project",
+  workspaceRoot: "/workspace/project",
+  defaultModelSelection: null,
+  scripts: [],
+  createdAt: timestamp,
+  updatedAt: timestamp,
+  deletedAt: null,
+};
+
 const makeImporter = Effect.fn(function* (
-  candidates: ReadonlyArray<ReturnType<typeof candidate>>,
+  candidates:
+    | ReadonlyArray<ReturnType<typeof candidate>>
+    | (() => ReadonlyArray<ReturnType<typeof candidate>>),
   beforeTransaction: Effect.Effect<void> = Effect.void,
   settings: Layer.Layer<
     ServerSettings.ServerSettingsService,
@@ -218,20 +231,17 @@ const makeImporter = Effect.fn(function* (
             yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository,
           ),
           Layer.mock(AgentSessionScanner.AgentSessionScanner)({
-            recentThreads: () => Stream.fromIterable(candidates),
+            recentThreads: (_root, _completed, options) =>
+              Stream.fromIterable(
+                (typeof candidates === "function" ? candidates() : candidates).filter(
+                  (entry) => options?.skipTranscript?.(entry.source) !== true,
+                ),
+              ),
+            refreshCandidates: Effect.void,
           }),
           Layer.mock(ProjectService.ProjectService)({
-            getById: () =>
-              Effect.succeedSome({
-                id: projectId,
-                title: "Project",
-                workspaceRoot: "/workspace/project",
-                defaultModelSelection: null,
-                scripts: [],
-                createdAt: timestamp,
-                updatedAt: timestamp,
-                deletedAt: null,
-              }),
+            getById: () => Effect.succeedSome(project),
+            listPage: () => Effect.succeed({ projects: [project], nextCursor: null }),
           }),
           Layer.mock(Orchestrator.OrchestratorV2)({
             getThreadRecords: (threadId, fields) =>
@@ -248,7 +258,11 @@ const makeImporter = Effect.fn(function* (
     ),
   );
   const importer = Context.get(context, AgentSessionImporter.AgentSessionImporter);
-  return { run: importer.importRecentAgentThreads({ projectId }), published };
+  return {
+    run: importer.importRecentAgentThreads({ projectId }),
+    sync: importer.syncAllProjects,
+    published,
+  };
 });
 
 it.effect(
@@ -448,4 +462,43 @@ it.effect("imports under a policy ceiling in the project's default, kept under t
       "auto-accept-edits",
     );
   }).pipe(Effect.scoped, Effect.provide(persistence)),
+);
+
+it.effect(
+  "background sync imports sessions started after setup and stops re-reading T3's own transcripts",
+  () =>
+    Effect.gen(function* () {
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const native = candidate(CODEX_MODEL_SELECTION, "native");
+      yield* seedOwner(native);
+      const first = candidate(CODEX_MODEL_SELECTION, "terminal-1");
+      const later = candidate(
+        CLAUDE_MODEL_SELECTION,
+        "7d0c4c1e-1f0a-4f53-9d43-4b1f5d1d6a10",
+        "claudeAgent",
+      );
+      const onDisk = [native, first];
+      const importer = yield* makeImporter(() => onDisk);
+
+      // The native transcript is read once, found to be T3's own, and remembered.
+      expect(yield* importer.sync).toBe(1);
+      expect(yield* Effect.option(projections.getThread(importId(first)))).not.toEqual(
+        Option.none(),
+      );
+
+      // A session started in a terminal after the first sync, and the native one
+      // dropped from the stream: the mock only offers what skipTranscript lets through.
+      onDisk.push(later);
+      const before = importer.published.length;
+      expect(yield* importer.sync).toBe(2);
+      expect(yield* Effect.option(projections.getThread(importId(later)))).not.toEqual(
+        Option.none(),
+      );
+      expect(yield* Effect.option(projections.getThread(importId(native)))).toEqual(Option.none());
+      expect(
+        importer.published
+          .slice(before)
+          .flatMap((stored) => ("event" in stored ? [stored.event.threadId] : [])),
+      ).not.toContain(importId(first));
+    }).pipe(Effect.scoped, Effect.provide(persistence)),
 );

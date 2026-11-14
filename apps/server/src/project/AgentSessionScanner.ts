@@ -201,6 +201,19 @@ export type AgentSessionRecentThread =
   | { readonly _tag: "Duplicate"; readonly source: AgentSessionImportSource }
   | { readonly _tag: "Skipped" };
 
+export interface AgentSessionRecentThreadsOptions {
+  /**
+   * Called before a transcript is read; true skips it without reading. The
+   * background sync uses it for transcripts it already knows belong to T3's
+   * own threads, which change on every turn and would otherwise be re-read.
+   */
+  readonly skipTranscript?: (transcript: {
+    readonly filePath: string;
+    readonly size: number;
+    readonly mtimeMs: number | null;
+  }) => boolean;
+}
+
 export class AgentSessionScanner extends Context.Service<
   AgentSessionScanner,
   {
@@ -208,7 +221,10 @@ export class AgentSessionScanner extends Context.Service<
     readonly recentThreads: (
       workspaceRoot: string,
       completedSources?: ReadonlyArray<AgentSessionImportSource>,
+      options?: AgentSessionRecentThreadsOptions,
     ) => Stream.Stream<AgentSessionRecentThread, AgentSessionScanError>;
+    /** Re-lists transcripts on disk so sessions started after the last scan are seen. */
+    readonly refreshCandidates: Effect.Effect<void, AgentSessionScanError>;
   }
 >()("t3/project/AgentSessionScanner") {}
 
@@ -1659,6 +1675,7 @@ export const make = Effect.gen(function* () {
   const prepareRecentThreads = Effect.fn("AgentSessionScanner.prepareRecentThreads")(function* (
     workspaceRoot: string,
     completedSources: ReadonlyArray<AgentSessionImportSource>,
+    options: AgentSessionRecentThreadsOptions,
   ) {
     const root = path.resolve(expandHomePath(workspaceRoot, homeDir));
     const realRoot = yield* fileSystem.realPath(root).pipe(Effect.orElseSucceed(() => root));
@@ -1774,6 +1791,16 @@ export const make = Effect.gen(function* () {
             return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
           }
           const identity = transcriptIdentity(transcript.filePath, stats.value);
+          if (
+            completed === undefined &&
+            options.skipTranscript?.({
+              filePath: transcript.filePath,
+              size: identity.size,
+              mtimeMs: identity.mtimeMs,
+            }) === true
+          ) {
+            return Option.some<AgentSessionRecentThread>({ _tag: "Skipped" });
+          }
           const completedSource = completed?.find(
             (source) =>
               source.provider === candidate.source && sameTranscriptIdentity(source, identity),
@@ -1871,9 +1898,16 @@ export const make = Effect.gen(function* () {
   const recentThreads: AgentSessionScanner["Service"]["recentThreads"] = (
     workspaceRoot,
     completedSources = [],
-  ) => Stream.unwrap(prepareRecentThreads(workspaceRoot, completedSources));
+    options = {},
+  ) => Stream.unwrap(prepareRecentThreads(workspaceRoot, completedSources, options));
 
-  return AgentSessionScanner.of({ scan, recentThreads });
+  const refreshCandidates: AgentSessionScanner["Service"]["refreshCandidates"] = Effect.gen(
+    function* () {
+      cachedCandidates = (yield* collectCandidates()).candidates;
+    },
+  );
+
+  return AgentSessionScanner.of({ scan, recentThreads, refreshCandidates });
 });
 
 export const layer = Layer.effect(AgentSessionScanner, make).pipe(

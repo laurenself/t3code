@@ -25,12 +25,16 @@ import {
 } from "@t3tools/contracts";
 import { normalizeProjectPathForComparison } from "@t3tools/shared/path";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
+import * as Config from "effect/Config";
 import * as Context from "effect/Context";
+import * as Duration from "effect/Duration";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
 import * as EventSink from "../orchestration-v2/EventSink.ts";
@@ -42,6 +46,15 @@ import * as AgentSessionScanner from "./AgentSessionScanner.ts";
 import * as ProjectService from "./ProjectService.ts";
 
 const IMPORT_EVENT_PREFIX = "agent-session-import:v2";
+/**
+ * How often the server re-imports Claude Code / Codex / Pi sessions started
+ * outside T3 (in a terminal, an IDE) into every project. "0" turns it off.
+ */
+const SYNC_INTERVAL_ENV = "T3CODE_AGENT_SESSION_SYNC_INTERVAL";
+const DEFAULT_SYNC_INTERVAL = Duration.minutes(2);
+const SYNC_STARTUP_DELAY = Duration.seconds(20);
+const SYNC_PROJECT_PAGE_SIZE = 100;
+const MAX_IGNORED_TRANSCRIPTS = 10_000;
 const CLAUDE_SESSION_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const decodeImportedTranscriptPayload = Schema.decodeUnknownOption(
@@ -177,6 +190,15 @@ const make = Effect.gen(function* () {
   const runtimes = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
   const settingsService = yield* ServerSettings.ServerSettingsService;
   const ceiling = settingsService.managedPolicy?.limits?.maxRuntimeMode;
+  // Transcripts of threads T3 itself runs. Their turns rewrite the file constantly, so
+  // without this every sync tick would re-read them only to find them owned again.
+  const nativeTranscripts = new Set<string>();
+  const markNative = (filePath: string) => {
+    if (nativeTranscripts.size >= MAX_IGNORED_TRANSCRIPTS) nativeTranscripts.clear();
+    nativeTranscripts.add(filePath);
+  };
+  const skipTranscript = (transcript: { readonly filePath: string }) =>
+    nativeTranscripts.has(transcript.filePath);
   const importRecentAgentThreads = Effect.fn("importRecentAgentThreadsV2")(function* (
     input: AgentSessionImportInput,
   ) {
@@ -231,7 +253,9 @@ const make = Effect.gen(function* () {
       }
       return payload.value.importedTranscripts ?? [];
     });
-    const outcomes = scanner.recentThreads(project.workspaceRoot, completedSources);
+    const outcomes = scanner.recentThreads(project.workspaceRoot, completedSources, {
+      skipTranscript,
+    });
     const importedThreadIds = new Set<ThreadId>();
     let importedCount = 0;
     let skippedCount = 0;
@@ -427,7 +451,10 @@ const make = Effect.gen(function* () {
               },
             ],
           });
-          if (committed.length === 0) return null;
+          if (committed.length === 0) {
+            markNative(source.filePath);
+            return null;
+          }
           yield* persistRuntime;
           yield* runtimes.recordImportedTranscript({ threadId, source });
           return true;
@@ -452,7 +479,67 @@ const make = Effect.gen(function* () {
     return { importedCount, skippedCount } satisfies AgentSessionImportResult;
   });
 
-  return { importRecentAgentThreads };
+  // One import at a time: the onboarding request and the background sync share
+  // the ignored-transcript memo and would otherwise read the same files twice.
+  const importLock = yield* Semaphore.make(1);
+  const importLocked = (input: AgentSessionImportInput) =>
+    importLock.withPermits(1)(importRecentAgentThreads(input));
+
+  const syncAllProjects = Effect.gen(function* () {
+    yield* scanner.refreshCandidates;
+    let cursor: number | null = 0;
+    let imported = 0;
+    while (cursor !== null) {
+      const page: Effect.Success<ReturnType<typeof projects.listPage>> = yield* projects.listPage({
+        cursor,
+        limit: SYNC_PROJECT_PAGE_SIZE,
+      });
+      for (const project of page.projects) {
+        const result = yield* importLocked({
+          projectId: project.id,
+          expectedWorkspaceRoot: project.workspaceRoot,
+        }).pipe(
+          Effect.catch((cause) =>
+            Effect.logDebug("Agent session sync skipped a project", {
+              projectId: project.id,
+              cause,
+            }).pipe(Effect.as(null)),
+          ),
+        );
+        if (result !== null) imported += result.importedCount;
+      }
+      cursor = page.nextCursor;
+    }
+    return imported;
+  });
+
+  const syncInterval = yield* Config.option(Config.String(SYNC_INTERVAL_ENV)).pipe(
+    Effect.map(
+      Option.match({
+        onNone: () => Option.some(DEFAULT_SYNC_INTERVAL),
+        onSome: (raw) => {
+          const trimmed = raw.trim();
+          if (trimmed === "0" || trimmed === "off" || trimmed === "false") return Option.none();
+          return Option.orElse(Duration.fromInput(trimmed as Duration.Input), () =>
+            Option.some(DEFAULT_SYNC_INTERVAL),
+          );
+        },
+      }),
+    ),
+    Effect.orElseSucceed(() => Option.some(DEFAULT_SYNC_INTERVAL)),
+  );
+  if (Option.isSome(syncInterval)) {
+    yield* syncAllProjects.pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("Agent session sync failed", { cause }).pipe(Effect.as(0)),
+      ),
+      Effect.repeat(Schedule.spaced(syncInterval.value)),
+      Effect.delay(SYNC_STARTUP_DELAY),
+      Effect.forkScoped,
+    );
+  }
+
+  return { importRecentAgentThreads: importLocked, syncAllProjects };
 });
 
 type AgentSessionImporterShape = Effect.Success<typeof make>;

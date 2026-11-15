@@ -6,7 +6,6 @@ import {
   isRuntimeModeAbove,
   AgentSessionImportProjectChangedError,
   AgentSessionImportProjectNotFoundError,
-  AgentSessionImportSource,
   AgentSessionScanError,
   AgentSessionSource,
   EventId,
@@ -16,6 +15,7 @@ import {
   ThreadId,
   TurnItemId,
   type AgentSessionImportInput,
+  type AgentSessionImportSource,
   type AgentSessionImportResult,
   type OrchestrationV2AppThread,
   type OrchestrationV2ConversationMessage,
@@ -44,6 +44,8 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
+import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
+import * as ThreadCommandExecutor from "../orchestration-v2/ThreadCommandExecutor.ts";
 import * as ProviderSessionManager from "../orchestration-v2/ProviderSessionManager.ts";
 import * as TurnItemPositionStore from "../orchestration-v2/TurnItemPositionStore.ts";
 import * as ProviderSessionRuntime from "../persistence/ProviderSessionRuntime.ts";
@@ -85,12 +87,6 @@ const STALLED_TURN_MS = 15 * 60 * 1000;
 const RUN_WINDOW_SLACK_MS = 2_000;
 const CLAUDE_SESSION_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const decodeImportedTranscriptPayload = Schema.decodeUnknownOption(
-  Schema.Struct({
-    cwd: Schema.optional(Schema.String),
-    importedTranscripts: Schema.optional(Schema.Array(AgentSessionImportSource)),
-  }),
-);
 
 class AgentSessionUnresumableSessionError extends Schema.TaggedError<AgentSessionUnresumableSessionError>()(
   "AgentSessionUnresumableSessionError",
@@ -126,14 +122,38 @@ class AgentSessionThreadModifiedError extends Schema.TaggedError<AgentSessionThr
   }
 }
 
+// ACP imports read the history while holding the session-mutation lock, and an agent can
+// leave session/resume or initialize unanswered. Longer than session/load's own deadline.
+const NATIVE_HISTORY_READ_TIMEOUT = "2 minutes";
+
+/**
+ * Whether a thread bound to a native session still lacks its native history.
+ * Once a turn has run, the native session also holds that turn's messages, so
+ * its history can no longer be imported as run-less items.
+ */
+export function isNativeHistoryPending(input: {
+  readonly historyOrigin: OrchestrationV2AppThread["historyOrigin"];
+  readonly hasRun: boolean;
+}): boolean {
+  return input.historyOrigin !== "v1_import" && !input.hasRun;
+}
+
 const TITLE_SEPARATOR = " · ";
 /** The thread list shows no folder, so a mirrored session's title leads with its project. */
-const nativeSessionTitle = (project: string, session: string) =>
-  `${project}${TITLE_SEPARATOR}${session.trim() === "" ? "Untitled thread" : session}`;
+const nativeSessionTitle = (project: string, session: string) => {
+  if (session.trim() === "") return `${project}${TITLE_SEPARATOR}Untitled thread`;
+  // A T3 turn writes the thread's title back into the session, prefix included.
+  if (session.startsWith(`${project}${TITLE_SEPARATOR}`)) return session;
+  return `${project}${TITLE_SEPARATOR}${session}`;
+};
 
 function dateTime(value: string): DateTime.Utc {
   return DateTime.makeUnsafe(value);
 }
+
+type HistoryMessage = Omit<AgentSessionScanner.AgentSessionThreadMessage, "role"> & {
+  readonly role: AgentSessionScanner.AgentSessionThreadMessage["role"] | "reasoning";
+};
 
 /**
  * Names a turn the transcript gained after the import. The transcript is
@@ -146,7 +166,7 @@ function syncedMessageKey(message: AgentSessionScanner.AgentSessionThreadMessage
 function messageEvents(
   input: {
     readonly threadId: ThreadId;
-    readonly message: AgentSessionScanner.AgentSessionThreadMessage;
+    readonly message: HistoryMessage;
   } & ({ readonly index: number } | { readonly key: string }),
 ): ReadonlyArray<OrchestrationV2DomainEvent> {
   const ordinal = "index" in input ? input.index + 1 : 1;
@@ -156,20 +176,6 @@ function messageEvents(
     `${IMPORT_EVENT_PREFIX}:turn-item:${input.threadId}:${suffix}`,
   );
   const at = dateTime(input.message.createdAt);
-  const message: OrchestrationV2ConversationMessage = {
-    createdBy: input.message.role === "user" ? "user" : "agent",
-    creationSource: "server",
-    id: messageId,
-    threadId: input.threadId,
-    runId: null,
-    nodeId: null,
-    role: input.message.role,
-    text: input.message.text,
-    attachments: [],
-    streaming: false,
-    createdAt: at,
-    updatedAt: at,
-  };
   const common = {
     id: turnItemId,
     threadId: input.threadId,
@@ -184,6 +190,32 @@ function messageEvents(
     title: null,
     startedAt: at,
     completedAt: at,
+    updatedAt: at,
+  };
+  const turnItemEvent = (payload: OrchestrationV2TurnItem): OrchestrationV2DomainEvent => ({
+    id: EventId.make(turnItemId),
+    type: "turn-item.updated",
+    threadId: input.threadId,
+    occurredAt: at,
+    payload,
+  });
+  if (input.message.role === "reasoning") {
+    return [
+      turnItemEvent({ ...common, type: "reasoning", text: input.message.text, streaming: false }),
+    ];
+  }
+  const message: OrchestrationV2ConversationMessage = {
+    createdBy: input.message.role === "user" ? "user" : "agent",
+    creationSource: "server",
+    id: messageId,
+    threadId: input.threadId,
+    runId: null,
+    nodeId: null,
+    role: input.message.role,
+    text: input.message.text,
+    attachments: [],
+    streaming: false,
+    createdAt: at,
     updatedAt: at,
   };
   const turnItem: OrchestrationV2TurnItem =
@@ -213,13 +245,7 @@ function messageEvents(
       occurredAt: at,
       payload: message,
     },
-    {
-      id: EventId.make(`${IMPORT_EVENT_PREFIX}:turn-item:${input.threadId}:${suffix}`),
-      type: "turn-item.updated",
-      threadId: input.threadId,
-      occurredAt: at,
-      payload: turnItem,
-    },
+    turnItemEvent(turnItem),
   ];
 }
 
@@ -235,6 +261,8 @@ const make = Effect.gen(function* () {
   const turnItemPositions = yield* TurnItemPositionStore.TurnItemPositionStoreV2;
   const sql = yield* SqlClient.SqlClient;
   const runtimes = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+  const registry = yield* ProviderAdapterRegistry.ProviderAdapterRegistryV2;
+  const threadCommands = yield* ThreadCommandExecutor.ThreadCommandExecutor;
   const settingsService = yield* ServerSettings.ServerSettingsService;
   const ceiling = settingsService.managedPolicy?.limits?.maxRuntimeMode;
   // Transcripts of threads T3 itself runs. Their turns rewrite the file constantly, so
@@ -479,8 +507,9 @@ const make = Effect.gen(function* () {
         const runtime = yield* runtimes.getByThreadId({ threadId });
         const filePath = Option.isNone(runtime)
           ? undefined
-          : Option.getOrUndefined(decodeImportedTranscriptPayload(runtime.value.runtimePayload))
-              ?.importedTranscripts?.[0]?.filePath;
+          : Option.getOrUndefined(
+              AgentSessionScanner.decodeImportedTranscriptPayload(runtime.value.runtimePayload),
+            )?.importedTranscripts?.[0]?.filePath;
         const modifiedAt =
           filePath === undefined
             ? null
@@ -561,7 +590,7 @@ const make = Effect.gen(function* () {
       )).map((row) => row.threadId),
     );
     const completedSources = runtimeRows.flatMap((runtime) => {
-      const payload = decodeImportedTranscriptPayload(runtime.runtimePayload);
+      const payload = AgentSessionScanner.decodeImportedTranscriptPayload(runtime.runtimePayload);
       if (
         untitled.has(runtime.threadId) ||
         Option.isNone(payload) ||
@@ -630,7 +659,7 @@ const make = Effect.gen(function* () {
                 thread.source === "claudeAgent"
                   ? { threadId, resume: thread.providerSessionId }
                   : { threadId: nativeThreadId },
-              runtimePayload: { cwd: project.workspaceRoot },
+              runtimePayload: { cwd: outcome.worktree?.path ?? project.workspaceRoot },
             },
             { onConflict: "ignore" },
           );
@@ -646,6 +675,7 @@ const make = Effect.gen(function* () {
             if (existing.value.thread.historyOrigin !== "v1_import") {
               return yield* new AgentSessionThreadModifiedError({ threadId });
             }
+            // A transcript that grew after the import gets its new turns appended below.
             yield* persistRuntime;
             // Leaving the transcript unrecorded makes the next pass read it again.
             const appended = yield* appendOutsideTurns({ threadId, thread });
@@ -684,8 +714,8 @@ const make = Effect.gen(function* () {
             modelSelection: { instanceId: thread.providerInstanceId, model },
             runtimeMode,
             interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-            branch: null,
-            worktreePath: null,
+            branch: outcome.worktree?.branch ?? null,
+            worktreePath: outcome.worktree?.path ?? null,
             linkedPullRequest: null,
             branchPullRequest: null,
             activeProviderThreadId: providerThreadId,
@@ -830,6 +860,104 @@ const make = Effect.gen(function* () {
     );
 
     return { importedCount, skippedCount } satisfies AgentSessionImportResult;
+  });
+
+  /**
+   * Loading a native session replays its history only into the adapter's own
+   * snapshot, so copy that snapshot into the thread as run-less history. The
+   * `v1_import` origin keeps it in forks and marks the import done, so a call
+   * after a failed read repairs the thread and any later call does nothing.
+   */
+  const importNativeHistory = Effect.fn("importNativeHistoryV2")(function* (input: {
+    readonly threadId: ThreadId;
+    readonly workspaceRoot: string;
+  }) {
+    const pendingThread = Effect.map(
+      orchestrator.getThreadRecords(input.threadId, ["providerThreads", "runs"]),
+      (records) =>
+        isNativeHistoryPending({
+          historyOrigin: records.thread.historyOrigin,
+          hasRun: records.runs.length > 0,
+        })
+          ? records
+          : null,
+    );
+    // Thread commands write whole thread rows, so hold their lock from the
+    // re-read through the write to keep both this marker and their changes.
+    const commit = (messages: ReadonlyArray<HistoryMessage>) =>
+      threadCommands.withLock(
+        input.threadId,
+        Effect.gen(function* () {
+          const current = yield* pendingThread;
+          if (current === null) return 0;
+          yield* eventSink.write({
+            events: [
+              ...messages.flatMap((message, index) =>
+                messageEvents({ threadId: input.threadId, index, message }),
+              ),
+              {
+                id: EventId.make(`${IMPORT_EVENT_PREFIX}:thread:${input.threadId}:native-history`),
+                type: "thread.metadata-updated",
+                threadId: input.threadId,
+                providerInstanceId: current.thread.providerInstanceId,
+                occurredAt: yield* DateTime.now,
+                payload: { ...current.thread, historyOrigin: "v1_import" },
+              },
+            ],
+          });
+          return messages.length;
+        }),
+      );
+    const records = yield* pendingThread;
+    if (records === null) return 0;
+    const { thread, providerThreads } = records;
+    const providerThread = providerThreads.find(
+      (candidate) => candidate.appThreadId === input.threadId && candidate.nativeThreadRef !== null,
+    );
+    const nativeThreadId = providerThread?.nativeThreadRef?.nativeId;
+    if (providerThread === undefined || nativeThreadId == null) return 0;
+    const providerSessionId = yield* idAllocator.allocate.providerSession({
+      providerInstanceId: providerThread.providerInstanceId,
+      threadId: input.threadId,
+    });
+    // The registry admits this open against sign-in changes, like any other open.
+    const adapter = yield* registry.get(thread.modelSelection.instanceId);
+    const snapshot = yield* adapter
+      .openSession({
+        threadId: input.threadId,
+        providerSessionId,
+        modelSelection: thread.modelSelection,
+        runtimePolicy: {
+          runtimeMode: thread.runtimeMode,
+          interactionMode: thread.interactionMode,
+          cwd: thread.worktreePath ?? input.workspaceRoot,
+        },
+        initialNativeThreadId: nativeThreadId,
+        ...(providerThread.nativeMetadata?.itemIdentityVersion === undefined
+          ? {}
+          : {
+              initialProviderItemIdentityVersion: providerThread.nativeMetadata.itemIdentityVersion,
+            }),
+      })
+      .pipe(
+        Effect.flatMap((session) => session.readThreadSnapshot({ providerThread })),
+        Effect.timeout(NATIVE_HISTORY_READ_TIMEOUT),
+        Effect.scoped,
+      );
+    const reasoningIds = new Set(snapshot.reasoningMessageIds);
+    const messages = snapshot.messages.flatMap((message) =>
+      (message.role === "user" || message.role === "assistant") && message.text.trim() !== ""
+        ? [
+            {
+              role: reasoningIds.has(message.id) ? ("reasoning" as const) : message.role,
+              text: message.text,
+              createdAt: DateTime.formatIso(message.createdAt),
+            },
+          ]
+        : [],
+    );
+    // Loading the session can take a while, and the thread is usable meanwhile.
+    return yield* commit(messages);
   });
 
   // One import at a time: the onboarding request and the background sync share
@@ -985,7 +1113,7 @@ const make = Effect.gen(function* () {
     );
   }
 
-  return { importRecentAgentThreads: importLocked, syncAllProjects };
+  return { importRecentAgentThreads: importLocked, importNativeHistory, syncAllProjects };
 });
 
 type AgentSessionImporterShape = Effect.Success<typeof make>;

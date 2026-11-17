@@ -56,19 +56,21 @@ it.effect("a terminal that is mid-turn keeps the session", () =>
   ),
 );
 
-it.live("an idle terminal is closed so T3 is the only writer", () =>
-  Effect.gen(function* () {
-    const child = yield* Effect.acquireRelease(
-      Effect.sync(() => NodeChildProcess.spawn("sleep", ["60"], { stdio: "ignore" })),
-      (spawned) => Effect.sync(() => spawned.kill("SIGKILL")),
-    );
-    const pid = child.pid ?? 0;
-    expect(isProcessAlive(pid)).toBe(true);
-    yield* withSessions([{ pid, sessionId, status: "idle", entrypoint: "cli" }], (configDir) =>
-      Effect.gen(function* () {
-        expect(yield* claimClaudeSession({ configDir, sessionId })).toEqual({ _tag: "Free" });
-      }),
-    );
-    expect(isProcessAlive(pid)).toBe(false);
-  }).pipe(Effect.scoped),
+it.live.each(["idle", "shell"] as const)(
+  "a %s terminal is closed so T3 is the only writer",
+  (status) =>
+    Effect.gen(function* () {
+      const child = yield* Effect.acquireRelease(
+        Effect.sync(() => NodeChildProcess.spawn("sleep", ["60"], { stdio: "ignore" })),
+        (spawned) => Effect.sync(() => spawned.kill("SIGKILL")),
+      );
+      const pid = child.pid ?? 0;
+      expect(isProcessAlive(pid)).toBe(true);
+      yield* withSessions([{ pid, sessionId, status, entrypoint: "cli" }], (configDir) =>
+        Effect.gen(function* () {
+          expect(yield* claimClaudeSession({ configDir, sessionId })).toEqual({ _tag: "Free" });
+        }),
+      );
+      expect(isProcessAlive(pid)).toBe(false);
+    }).pipe(Effect.scoped),
 );

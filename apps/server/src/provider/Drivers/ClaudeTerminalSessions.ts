@@ -64,9 +64,9 @@ export type ClaudeTerminalClaim =
   | { readonly _tag: "Stuck"; readonly pid: number };
 
 /**
- * Makes T3 the only process on a Claude session. A terminal sitting idle on it
- * is closed (`claude --resume` reopens it with everything T3 adds); one that is
- * mid-turn is left alone and reported.
+ * Makes T3 the only process on a Claude session. A terminal sitting idle on it,
+ * even with background commands running, is closed (`claude --resume` reopens it
+ * with everything T3 adds); one that is mid-turn is left alone and reported.
  */
 export const claimClaudeSession = Effect.fn("claimClaudeSession")(function* (input: {
   readonly configDir: string;
@@ -91,7 +91,8 @@ export const claimClaudeSession = Effect.fn("claimClaudeSession")(function* (inp
       continue;
     }
     const pid = record.value.pid;
-    if (record.value.status !== "idle") {
+    // "shell" is an idle prompt with background commands still running: no turn is in flight.
+    if (record.value.status !== "idle" && record.value.status !== "shell") {
       return { _tag: "Busy", pid } satisfies ClaudeTerminalClaim;
     }
     yield* Effect.sync(() => {
